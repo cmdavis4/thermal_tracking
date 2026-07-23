@@ -17,6 +17,9 @@ export chain_w_maxima,
     smooth_trajectories,
     compute_thermal_shapes,
     normalize_thermals,
-    write_rams_grid
+    write_rams_grid,
+    composite,
+    derived,
+    derived_sum
 
 end

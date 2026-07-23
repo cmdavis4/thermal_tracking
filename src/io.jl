@@ -6,15 +6,15 @@ using Dates
 # ──────────────────────────────────────────────────────────────────
 
 function println(x)
-    Base.println(x)
-    flush(stdout)
-    flush(stderr)
+	Base.println(x)
+	flush(stdout)
+	flush(stderr)
 end
 
 function print(x)
-    Base.print(x)
-    flush(stdout)
-    flush(stderr)
+	Base.print(x)
+	flush(stdout)
+	flush(stderr)
 end
 
 # ──────────────────────────────────────────────────────────────────
@@ -22,106 +22,245 @@ end
 # ──────────────────────────────────────────────────────────────────
 
 struct ThermalTimeStep
-    center_x::Float64
-    center_y::Float64
-    center_z::Float64
-    sphere_radius::Float64
-    dt_thermal_seconds::Float64
-    time::DateTime
+	center_x::Float64
+	center_y::Float64
+	center_z::Float64
+	sphere_radius::Float64
+	dt_thermal_seconds::Float64
+	time::DateTime
 end
 
 struct ThermalTrack
-    thermal_ix::Int   # 0-based, matching Python convention
-    timesteps::Vector{ThermalTimeStep}
+	thermal_ix::Int   # 0-based, matching Python convention
+	timesteps::Vector{ThermalTimeStep}
+end
+
+# ──────────────────────────────────────────────────────────────────
+# Composited-variable specs (used by normalize_thermals)
+# ──────────────────────────────────────────────────────────────────
+
+"""
+Specification for one variable to composite onto the normalized spherical grid.
+
+- `name`    — output variable name written to the normalized dataset.
+- `inputs`  — RAMS variable(s) read from the output file to build it.
+- `combine` — maps a `Dict{String, Array{Float64,3}}` (each input's native-grid subset)
+              to the combined native-grid field, evaluated *before* interpolation.
+
+Derived quantities are computed on the native RAMS grid and interpolated once. This is the
+physically correct order for nonlinear quantities (a nonlinear function of interpolated
+fields ≠ the interpolated nonlinear field); for linear sums the two orders agree, but doing
+it here also cuts memory/runtime by storing one output field instead of every input species.
+
+All inputs of a spec must share the same Arakawa-C staggering (all scalar, or all on the
+same momentum axis), since they're combined pointwise on one grid — see `_staggered_axis`.
+"""
+struct CompositeSpec
+	name::String
+	inputs::Vector{String}
+	combine::Function
+end
+
+"""Pass-through composite: interpolate RAMS variable `name` as-is."""
+function composite(name::AbstractString)::CompositeSpec
+	nm = String(name)
+	CompositeSpec(nm, [nm], native -> native[nm])
+end
+
+"""
+Derived composite `name` computed on the native RAMS grid from `inputs` before
+interpolation. `combine` receives a `Dict` mapping each input name to its native-grid
+(subset) array and returns the combined native-grid array, e.g.
+`derived("RH", ["THETA", "PI", "RV"], native -> compute_rh(native["THETA"], ...))`.
+"""
+function derived(name::AbstractString, inputs, combine::Function)::CompositeSpec
+	CompositeSpec(String(name), String.(collect(inputs)), combine)
+end
+
+"""
+Convenience derived composite that sums `inputs` into one field (e.g. total ice mixing
+ratio from the individual ice-species mixing ratios): `derived_sum("R_ice", [...])`.
+"""
+function derived_sum(name::AbstractString, inputs)::CompositeSpec
+	input_names = String.(collect(inputs))
+	CompositeSpec(String(name), input_names, native -> sum(native[v] for v in input_names))
 end
 
 # ──────────────────────────────────────────────────────────────────
 # RAMS grid / path helpers
 # ──────────────────────────────────────────────────────────────────
 
-function read_rams_grid(path::String)
-    NCDataset(path, "r") do ds
-        (x=Float64.(ds["x"][:]), y=Float64.(ds["y"][:]), z=Float64.(ds["z"][:]))
-    end
+"""
+Derive Arakawa-C momentum levels from thermodynamic levels as the midpoints between
+consecutive T-levels (top level extrapolated with the last spacing). Exact on a uniform
+grid (`m[k] = t[k] + dz/2`); only approximate on a stretched grid, where the true `zmn`
+levels should be read from the RAMS header instead. Used only as a fallback for grid
+files written before momentum levels were stored.
+"""
+function _derive_momentum_levels(t_levels::Vector{Float64})::Vector{Float64}
+	n = length(t_levels)
+	n == 1 && return copy(t_levels)
+	m = similar(t_levels)
+	for k in 1:(n-1)
+		m[k] = 0.5 * (t_levels[k] + t_levels[k+1])
+	end
+	# Top momentum level: extrapolate one half-step above the last thermo level
+	m[n] = t_levels[n] + 0.5 * (t_levels[n] - t_levels[n-1])
+	return m
 end
 
-function datetime_to_rams_path(rams_dir::String, dt::DateTime)::String
-    datestr = Dates.format(dt, dateformat"yyyy-mm-dd-HHMMSS")
-    joinpath(rams_dir, "a-L-$(datestr)-g1.h5")
+"""
+Read the RAMS grid coordinates. Returns thermodynamic (scalar) levels `x, y, z` and the
+Arakawa-C momentum levels `xm, ym, zm` (where staggered variables live: U on `xm`, V on
+`ym`, W on `zm`). Momentum levels are read directly if present; for older grid files that
+predate them they are derived from the thermo levels (see `_derive_momentum_levels`).
+"""
+function read_rams_grid(path::String)
+	NCDataset(path, "r") do ds
+		x = Float64.(ds["x"][:])
+		y = Float64.(ds["y"][:])
+		z = Float64.(ds["z"][:])
+		if haskey(ds, "xm") && haskey(ds, "ym") && haskey(ds, "zm")
+			xm = Float64.(ds["xm"][:])
+			ym = Float64.(ds["ym"][:])
+			zm = Float64.(ds["zm"][:])
+		else
+			@warn "rams_grid.nc has no momentum levels (xm/ym/zm); deriving them from the " *
+				  "thermo levels (exact only for a uniform grid). Regenerate with " *
+				  "write_rams_grid to store the true RAMS momentum levels."
+			xm = _derive_momentum_levels(x)
+			ym = _derive_momentum_levels(y)
+			zm = _derive_momentum_levels(z)
+		end
+		(x=x, y=y, z=z, xm=xm, ym=ym, zm=zm)
+	end
+end
+
+function datetime_to_rams_path(
+	rams_dir::String,
+	dt::DateTime;
+	lite::Bool=true,
+)::String
+	datestr = Dates.format(dt, dateformat"yyyy-mm-dd-HHMMSS")
+	joinpath(rams_dir, "a-$(lite ? "L" : "A")-$(datestr)-g1.h5")
 end
 
 """Parse the datetime encoded in a RAMS filename of the form `a-L-YYYY-mm-dd-HHMMSS-g1.h5`."""
 function rams_path_to_datetime(path::String)::DateTime
-    name = basename(path)
-    # name = a-L-YYYY-mm-dd-HHMMSS-g1.h5
-    m = match(r"^a-L-(\d{4})-(\d{2})-(\d{2})-(\d{6})-g1\.h5$", name)
-    m === nothing && error("RAMS filename does not match expected pattern: $name")
-    y, mo, d, hms = m.captures
-    DateTime(parse(Int, y), parse(Int, mo), parse(Int, d),
-             parse(Int, hms[1:2]), parse(Int, hms[3:4]), parse(Int, hms[5:6]))
+	name = basename(path)
+	# name = a-L-YYYY-mm-dd-HHMMSS-g1.h5
+	m = match(r"^a-L-(\d{4})-(\d{2})-(\d{2})-(\d{6})-g1\.h5$", name)
+	m === nothing &&
+		error("RAMS filename does not match expected pattern: $name")
+	y, mo, d, hms = m.captures
+	DateTime(
+		parse(Int, y),
+		parse(Int, mo),
+		parse(Int, d),
+		parse(Int, hms[1:2]),
+		parse(Int, hms[3:4]),
+		parse(Int, hms[5:6]),
+	)
 end
 
 """Enumerate RAMS lite files `a-L-*-g1.h5` in `dir`, sorted by datetime."""
 function list_rams_files(dir::String)::Vector{String}
-    all_files = readdir(dir; join=true)
-    rams = filter(p -> occursin(r"^a-L-.*-g1\.h5$", basename(p)), all_files)
-    sort!(rams; by=rams_path_to_datetime)
-    return rams
+	all_files = readdir(dir; join=true)
+	rams = filter(p -> occursin(r"^a-L-.*-g1\.h5$", basename(p)), all_files)
+	sort!(rams; by=rams_path_to_datetime)
+	return rams
 end
 
 """
 Read one `__<name>` block from an open RAMS header file. Advances `io` past the block.
 Returns `nothing` if the marker isn't found.
 """
-function _read_header_block(io::IO, marker::String)::Union{Nothing,Vector{Float64}}
-    seekstart(io)
-    for line in eachline(io)
-        if strip(line) == marker
-            n = parse(Int, strip(readline(io)))
-            return [parse(Float64, strip(readline(io))) for _ in 1:n]
-        end
-    end
-    return nothing
+function _read_header_block(
+	io::IO,
+	marker::String,
+)::Union{Nothing, Vector{Float64}}
+	seekstart(io)
+	for line in eachline(io)
+		if strip(line) == marker
+			n = parse(Int, strip(readline(io)))
+			return [parse(Float64, strip(readline(io))) for _ in 1:n]
+		end
+	end
+	return nothing
 end
 
 """
 Write `rams_grid.nc` with shifted x/y coords matching `xarrams.calculate_derived_variables`
 (which does `storm_ds["x"] -= min(storm_ds["x"])` so the grid starts at zero).
 
+Stores both the thermodynamic (scalar) levels `x, y, z` (from `__[xyz]tn01`) and the
+Arakawa-C momentum levels `xm, ym, zm` (from `__[xyz]mn01`), so staggered variables (U on
+`xm`, V on `ym`, W on `zm`) can be placed on their true grid downstream.
+
 Coord values come from the `-head.txt` file paired with the first RAMS `.h5` file —
 RAMS HDF5 outputs only carry phony dimensions, not coord arrays.
 """
-function write_rams_grid(rams_output_dir::AbstractString, output_path::AbstractString)
-    rams_output_dir = String(rams_output_dir)
-    output_path = String(output_path)
+function write_rams_grid(
+	rams_output_dir::AbstractString,
+	output_path::AbstractString,
+)
+	rams_output_dir = String(rams_output_dir)
+	output_path = String(output_path)
 
-    files = list_rams_files(rams_output_dir)
-    isempty(files) && error("No RAMS files found in $rams_output_dir")
+	files = list_rams_files(rams_output_dir)
+	isempty(files) && error("No RAMS files found in $rams_output_dir")
 
-    header_path = replace(files[1], r"g\d+\.h5$" => "head.txt")
-    isfile(header_path) || error("Expected header file not found: $header_path")
+	header_path = replace(files[1], r"g\d+\.h5$" => "head.txt")
+	isfile(header_path) || error("Expected header file not found: $header_path")
 
-    x, y, z = open(header_path, "r") do io
-        xv = _read_header_block(io, "__xtn01")
-        yv = _read_header_block(io, "__ytn01")
-        zv = _read_header_block(io, "__ztn01")
-        (xv === nothing || yv === nothing || zv === nothing) &&
-            error("Missing __xtn01/__ytn01/__ztn01 block in $header_path")
-        (xv, yv, zv)
-    end
+	xt, yt, zt, xm, ym, zm = open(header_path, "r") do io
+		xtn = _read_header_block(io, "__xtn01")
+		ytn = _read_header_block(io, "__ytn01")
+		ztn = _read_header_block(io, "__ztn01")
+		xmn = _read_header_block(io, "__xmn01")
+		ymn = _read_header_block(io, "__ymn01")
+		zmn = _read_header_block(io, "__zmn01")
+		(xtn === nothing || ytn === nothing || ztn === nothing) &&
+			error("Missing __xtn01/__ytn01/__ztn01 block in $header_path")
+		(xmn === nothing || ymn === nothing || zmn === nothing) && error(
+			"Missing __xmn01/__ymn01/__zmn01 (momentum) block in $header_path",
+		)
+		(xtn, ytn, ztn, xmn, ymn, zmn)
+	end
 
-    x .-= minimum(x)
-    y .-= minimum(y)
+	# Thermo and momentum axes must be index-aligned (same length) so one bounding-box index
+	# range applies to both — xm[k] is the U-point paired with scalar point xt[k], etc.
+	(
+		length(xm) == length(xt) &&
+		length(ym) == length(yt) &&
+		length(zm) == length(zt)
+	) || error(
+		"RAMS thermo/momentum level counts differ; cannot align staggered coordinates",
+	)
 
-    NCDataset(output_path, "c") do ds
-        defDim(ds, "x", length(x))
-        defDim(ds, "y", length(y))
-        defDim(ds, "z", length(z))
-        defVar(ds, "x", x, ("x",))
-        defVar(ds, "y", y, ("y",))
-        defVar(ds, "z", z, ("z",))
-    end
-    return output_path
+	# Shift x/y so the thermo grid starts at zero. Apply the SAME offset to the momentum
+	# levels so xm/xt (and ym/yt) stay in one frame — i.e. xm[k] = xt[k] + dx/2 is preserved.
+	# z is not shifted.
+	x_offset = minimum(xt)
+	y_offset = minimum(yt)
+	xt .-= x_offset
+	yt .-= y_offset
+	xm .-= x_offset
+	ym .-= y_offset
+
+	NCDataset(output_path, "c") do ds
+		defDim(ds, "x", length(xt))
+		defDim(ds, "y", length(yt))
+		defDim(ds, "z", length(zt))
+		defVar(ds, "x", xt, ("x",))
+		defVar(ds, "y", yt, ("y",))
+		defVar(ds, "z", zt, ("z",))
+		# Momentum levels share the thermo dimensions (same length, index-aligned)
+		defVar(ds, "xm", xm, ("x",))
+		defVar(ds, "ym", ym, ("y",))
+		defVar(ds, "zm", zm, ("z",))
+	end
+	return output_path
 end
 
 """
@@ -131,23 +270,23 @@ RAMS lite files have Python/ncdump dims (z, y, x). NCDatasets reverses this,
 so Julia sees (x, y, z).
 """
 function verify_rams_dims(
-    rams_path::String,
-    x_coords,
-    y_coords,
-    z_coords,
-    test_var::String,
+	rams_path::String,
+	x_coords,
+	y_coords,
+	z_coords,
+	test_var::String,
 )
-    NCDataset(rams_path, "r") do ds
-        sz = size(ds[test_var])
-        nx, ny, nz = length(x_coords), length(y_coords), length(z_coords)
-        expected = (nx, ny, nz)
-        if sz != expected
-            error(
-                "RAMS variable '$test_var' has Julia shape $sz, expected $expected (x,y,z).",
-            )
-        end
-        @info "RAMS dimension check passed: $test_var has shape $sz = (nx=$nx, ny=$ny, nz=$nz)"
-    end
+	NCDataset(rams_path, "r") do ds
+		sz = size(ds[test_var])
+		nx, ny, nz = length(x_coords), length(y_coords), length(z_coords)
+		expected = (nx, ny, nz)
+		if sz != expected
+			error(
+				"RAMS variable '$test_var' has Julia shape $sz, expected $expected (x,y,z).",
+			)
+		end
+		@info "RAMS dimension check passed: $test_var has shape $sz = (nx=$nx, ny=$ny, nz=$nz)"
+	end
 end
 
 # ──────────────────────────────────────────────────────────────────
@@ -156,37 +295,53 @@ end
 
 """Find the index range in `coords` (sorted ascending) covering [lo, hi]."""
 function coord_range(coords::Vector{Float64}, lo::Float64, hi::Float64)
-    i0 = max(1, searchsortedfirst(coords, lo) - 1)
-    i1 = min(length(coords), searchsortedlast(coords, hi) + 1)
-    return i0:i1
+	i0 = max(1, searchsortedfirst(coords, lo) - 1)
+	i1 = min(length(coords), searchsortedlast(coords, hi) + 1)
+	return i0:i1
 end
 
 function compute_spatial_subset(
-    track::ThermalTrack,
-    x_coords::Vector{Float64},
-    y_coords::Vector{Float64},
-    z_coords::Vector{Float64};
-    pad=1.5,
+	track::ThermalTrack,
+	x_coords::Vector{Float64},
+	y_coords::Vector{Float64},
+	z_coords::Vector{Float64};
+	pad=1.5,
+	xm_coords::Union{Nothing, Vector{Float64}}=nothing,
+	ym_coords::Union{Nothing, Vector{Float64}}=nothing,
+	zm_coords::Union{Nothing, Vector{Float64}}=nothing,
 )
-    max_sr = maximum(ts.sphere_radius for ts in track.timesteps)
+	# `pad` is the bounding-box half-extent in thermal radii. Callers should set it to the
+	# normalized grid's r_norm_max so the whole (r_norm ≤ r_norm_max) query sphere is covered;
+	# a smaller pad clips the outer shells and interpolates them to NaN.
+	max_sr = maximum(ts.sphere_radius for ts in track.timesteps)
 
-    x_lo = minimum(ts.center_x for ts in track.timesteps) - max_sr * pad
-    x_hi = maximum(ts.center_x for ts in track.timesteps) + max_sr * pad
-    y_lo = minimum(ts.center_y for ts in track.timesteps) - max_sr * pad
-    y_hi = maximum(ts.center_y for ts in track.timesteps) + max_sr * pad
-    z_lo = minimum(ts.center_z for ts in track.timesteps) - max_sr * pad
-    z_hi = maximum(ts.center_z for ts in track.timesteps) + max_sr * pad
+	x_lo = minimum(ts.center_x for ts in track.timesteps) - max_sr * pad
+	x_hi = maximum(ts.center_x for ts in track.timesteps) + max_sr * pad
+	y_lo = minimum(ts.center_y for ts in track.timesteps) - max_sr * pad
+	y_hi = maximum(ts.center_y for ts in track.timesteps) + max_sr * pad
+	z_lo = minimum(ts.center_z for ts in track.timesteps) - max_sr * pad
+	z_hi = maximum(ts.center_z for ts in track.timesteps) + max_sr * pad
 
-    x_ixs = coord_range(x_coords, x_lo, x_hi)
-    y_ixs = coord_range(y_coords, y_lo, y_hi)
-    z_ixs = coord_range(z_coords, z_lo, z_hi)
+	# Bounding-box index range is computed on the thermo grid and reused for the momentum
+	# grid (index-aligned, same length). The momentum coords carry the true staggered
+	# heights; fall back to the thermo coords if none were supplied.
+	x_ixs = coord_range(x_coords, x_lo, x_hi)
+	y_ixs = coord_range(y_coords, y_lo, y_hi)
+	z_ixs = coord_range(z_coords, z_lo, z_hi)
 
-    (
-        x_ixs=x_ixs,
-        y_ixs=y_ixs,
-        z_ixs=z_ixs,
-        x_sub=x_coords[x_ixs],
-        y_sub=y_coords[y_ixs],
-        z_sub=z_coords[z_ixs],
-    )
+	xm = xm_coords === nothing ? x_coords : xm_coords
+	ym = ym_coords === nothing ? y_coords : ym_coords
+	zm = zm_coords === nothing ? z_coords : zm_coords
+
+	(
+		x_ixs=x_ixs,
+		y_ixs=y_ixs,
+		z_ixs=z_ixs,
+		x_sub=x_coords[x_ixs],
+		y_sub=y_coords[y_ixs],
+		z_sub=z_coords[z_ixs],
+		xm_sub=xm[x_ixs],
+		ym_sub=ym[y_ixs],
+		zm_sub=zm[z_ixs],
+	)
 end
