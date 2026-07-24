@@ -60,7 +60,7 @@ Returns `(tracks, extras, extra_names, extra_attrs)`:
 NCDatasets reverses dimension order from Python/ncdump convention.
 For thermal_ds.nc with Python dims (thermal_ix, time), Julia sees (time, thermal_ix).
 """
-function read_thermal_tracks(path::String)
+function read_thermal_tracks(path::String; scale_var::String)
 	NCDataset(path, "r") do ds
 		thermal_ixs = Array(ds["thermal_ix"])
 		time_vals = Array(ds["time"])
@@ -68,10 +68,12 @@ function read_thermal_tracks(path::String)
 		n_thermals = length(thermal_ixs)
 		n_time = length(time_vals)
 
-		x_all = Array(ds["x"])
-		y_all = Array(ds["y"])
-		z_all = Array(ds["z"])
-		sr_all = Array(ds["sphere_radius"])
+		# Harmonized with the fit stage: composite around the SMOOTHED center and scale by
+		# the chosen (smoothed) sphere radius; `scale_var` selects which sphere method.
+		x_all = Array(ds["x_smoothed"])
+		y_all = Array(ds["y_smoothed"])
+		z_all = Array(ds["z_smoothed"])
+		sr_all = Array(ds[scale_var])
 		dt_all = Array(ds["dt_thermal_seconds"])
 
 		data_size = size(x_all)
@@ -94,7 +96,6 @@ function read_thermal_tracks(path::String)
 			"x",
 			"y",
 			"z",
-			"sphere_radius",
 			"dt_thermal_seconds",
 			"time",
 			"thermal_ix",
@@ -125,16 +126,30 @@ function read_thermal_tracks(path::String)
 			timesteps = ThermalTimeStep[]
 			per_track_extras = Dict(name => Float64[] for name in extra_names)
 			for di in 1:n_time
+				# Every field of a ThermalTimeStep must be a finite Float64. A timestep
+				# with no smoothed center (x/y/z), no timestep spacing (dt), or no sphere
+				# radius can't be composited, so skip it. The smoothed center can go
+				# missing on a timestep where sr survives (e.g. edge-of-domain / short
+				# tracks the smoothing stage couldn't fill in), so guard every field, not
+				# just sr — otherwise Float64(::Missing) throws below.
 				sr = get_val(sr_all, di, ti)
-				(ismissing(sr) || isnan(Float64(sr))) && continue
+				x_val = get_val(x_all, di, ti)
+				y_val = get_val(y_all, di, ti)
+				z_val = get_val(z_all, di, ti)
+				dt_val = get_val(dt_all, di, ti)
+				any_missing_or_nan =
+					ismissing(sr) || isnan(Float64(sr)) ||
+					ismissing(x_val) || ismissing(y_val) ||
+					ismissing(z_val) || ismissing(dt_val)
+				any_missing_or_nan && continue
 				push!(
 					timesteps,
 					ThermalTimeStep(
-						Float64(get_val(x_all, di, ti)),
-						Float64(get_val(y_all, di, ti)),
-						Float64(get_val(z_all, di, ti)),
+						Float64(x_val),
+						Float64(y_val),
+						Float64(z_val),
 						Float64(sr),
-						Float64(get_val(dt_all, di, ti)),
+						Float64(dt_val),
 						time_vals[di],
 					),
 				)
@@ -443,6 +458,7 @@ function normalize_thermals(;
 	lite::Bool=true,
 	azimuthal_average::Bool=true,
 	include_azimuthal_std::Bool=true,
+	scale_var::AbstractString="sphere_radius_disk_smoothed",
 )
 	# Normalize each requested variable into a CompositeSpec: bare strings become pass-through
 	# specs; CompositeSpec entries (from derived/derived_sum) are kept as-is.
@@ -456,7 +472,7 @@ function normalize_thermals(;
 
 	println("Reading thermal tracks from $thermal_ds_path")
 	tracks, extras, extra_names, extra_attrs =
-		read_thermal_tracks(thermal_ds_path)
+		read_thermal_tracks(thermal_ds_path; scale_var=String(scale_var))
 	println("  Found $(length(tracks)) thermals")
 	if !isempty(extra_names)
 		println(
