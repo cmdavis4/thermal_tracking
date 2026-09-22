@@ -587,6 +587,14 @@ azimuthal standard deviation as an anisotropy diagnostic.
 demand from compact per-file results, so only one variable's dense array exists at a time.
 Holding every variable dense at once took ~57 GB for 45 variables, because most
 (dt, thermal) slots are empty: thermals have different lifetimes.
+
+`compression_level` (0–9) sets LOSSLESS NetCDF deflate (zlib) compression with the byte
+shuffle filter; 0 writes uncompressed. Every value, NaN included, reads back bit-identical.
+The payoff is large because ~90% of the dense (dt, thermal) layout is NaN fill, and level 1
+already captures most of it at little extra write time. Composited fields are chunked one
+thermal at a time — all dt for one thermal, (r, θ) whole (plus one dt per chunk when φ is
+kept) — so a chunk holds one thermal's history, and its empty dt slots compress to almost
+nothing.
 """
 function _write_normalize_output(
 	path::String,
@@ -601,6 +609,7 @@ function _write_normalize_output(
 	extra_attrs::Dict{String, Dict{String, Any}};
 	azimuthal_average::Bool,
 	output_std::Union{Nothing, Function}=nothing,
+	compression_level::Int=1,
 )
 	thermal_ixs = [t.thermal_ix for t in tracks]
 
@@ -608,6 +617,11 @@ function _write_normalize_output(
 	t2d = ones(length(grid.r_vals)) * grid.theta_vals'
 	x_norm = r2d .* sin.(t2d)
 	z_norm = r2d .* cos.(t2d)
+
+	# Lossless compression keywords for defVar; empty when compression is off
+	compression_kwargs =
+		compression_level > 0 ?
+		(shuffle=true, deflatelevel=compression_level) : NamedTuple()
 
 	NCDataset(path, "c") do ds
 		defDim(ds, "dt_thermal_seconds", length(all_dt_seconds))
@@ -634,6 +648,7 @@ function _write_normalize_output(
 			Float64,
 			("dt_thermal_seconds", "thermal_ix");
 			fillvalue=NaN,
+			compression_kwargs...,
 			attrib=Dict(
 				"units" => "seconds since 2000-01-01 00:00:00",
 				"calendar" => "standard",
@@ -648,6 +663,7 @@ function _write_normalize_output(
 				Float64,
 				("dt_thermal_seconds", "thermal_ix");
 				fillvalue=NaN,
+				compression_kwargs...,
 				attrib=extra_attrs[name],
 			)
 			v[:, :] = extras_2d[name]
@@ -658,19 +674,34 @@ function _write_normalize_output(
 
 		# Composited-field dimensions in defVar (reversed) order, and the matching permutedims
 		# order that maps our (dt, thermal, r, θ[, φ]) storage into it. Averaged fields drop φ.
+		# Chunk sizes follow the same defVar order: one thermal per chunk (see the docstring).
+		n_dt = length(all_dt_seconds)
 		if azimuthal_average
 			field_dims = ("theta", "r_norm", "thermal_ix", "dt_thermal_seconds")
 			storage_to_defvar_perm = (4, 3, 2, 1)
+			field_chunk_sizes = (grid.n_theta, grid.n_r, 1, n_dt)
 		else
 			field_dims =
 				("phi", "theta", "r_norm", "thermal_ix", "dt_thermal_seconds")
 			storage_to_defvar_perm = (5, 4, 3, 2, 1)
+			# Keeping φ makes one thermal's whole history ~n_phi× larger, so one dt per chunk
+			field_chunk_sizes = (grid.n_phi, grid.n_theta, grid.n_r, 1, 1)
 		end
+		field_compression_kwargs =
+			compression_level > 0 ?
+			(compression_kwargs..., chunksizes=field_chunk_sizes) : NamedTuple()
 		all_colons = ntuple(_ -> Colon(), length(field_dims))
 
 		for var in composited_var_names
 			println("  Writing $var...")
-			v = defVar(ds, var, Float64, field_dims; fillvalue=NaN)
+			v = defVar(
+				ds,
+				var,
+				Float64,
+				field_dims;
+				fillvalue=NaN,
+				field_compression_kwargs...,
+			)
 			v[all_colons...] = permutedims(output(var), storage_to_defvar_perm)
 
 			# Azimuthal-asymmetry companion field (φ-std), same shape as the averaged field.
@@ -681,6 +712,7 @@ function _write_normalize_output(
 					Float64,
 					field_dims;
 					fillvalue=NaN,
+					field_compression_kwargs...,
 					attrib=Dict(
 						"long_name" => "azimuthal (phi) standard deviation of $var",
 					),
@@ -701,7 +733,7 @@ end
 	normalize_thermals(; thermal_ds_path, rams_output_dir, rams_grid_path, output_path,
 						 composited_vars, n_r=20, n_theta=36, n_phi=72, r_norm_max=2.0,
 						 lite=true, azimuthal_average=true, include_azimuthal_std=true,
-						 nonnegative_vars=String[], n_workers=1)
+						 nonnegative_vars=String[], n_workers=1, compression_level=1)
 
 Build a composite dataset in thermal-normalized spherical coordinates. For each
 thermal at each timestep, linearly interpolates RAMS data from the Cartesian
@@ -729,6 +761,9 @@ per-`(r, θ)` measure of how much azimuthal variation the mean is hiding.
 combines its inputs (and so before interpolation). Lossy (ZFP) compression turns true zeros
 into small values of either sign; clipping restores them. A derived total is summed from
 clipped species.
+
+`compression_level` (0–9, default 1) sets lossless deflate compression of the output file;
+0 writes it uncompressed. Values are bit-identical either way (see `_write_normalize_output`).
 
 # How the work is organized (and why it is fast)
 
@@ -764,6 +799,7 @@ function normalize_thermals(;
 	scale_var::AbstractString="sphere_radius_azimuthal_smoothed",
 	nonnegative_vars=String[],
 	n_workers::Int=1,
+	compression_level::Int=1,
 )
 	# Normalize each requested variable into a CompositeSpec: bare strings become pass-through
 	# specs; CompositeSpec entries (from derived/derived_sum) are kept as-is.
@@ -1019,6 +1055,7 @@ function normalize_thermals(;
 		azimuthal_average=azimuthal_average,
 		output_std=azimuthal_average && include_azimuthal_std ?
 				   (name -> assemble_dense(name, 2)) : nothing,
+		compression_level=compression_level,
 	)
 	println("Done.")
 	return nothing
