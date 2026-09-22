@@ -359,6 +359,13 @@ function _load_blocks(variable, blocks, field_buffer)
 	return field_buffer
 end
 
+# Full-domain field buffers, one per input POSITION within a spec, kept alive across files
+# in this process. Each is ~300 MB, and allocating a fresh set for every file made the GC do
+# a large share of the work. Every process (the main one, or each Distributed worker) has
+# its own copy of this module global, and each process runs one file at a time, so no
+# locking is needed. `normalize_thermals` empties it when it finishes.
+const _FIELD_BUFFERS = Dict{Int, Any}()
+
 """
 	_normalize_one_file(rams_path, timesteps, context)
 
@@ -430,7 +437,7 @@ function _normalize_one_file(
 
 	# One reusable full-domain buffer per input POSITION within a spec. A derived spec needs
 	# all of its inputs in memory at once, so each position gets its own buffer.
-	field_buffers = Dict{Int, Any}()
+	field_buffers = _FIELD_BUFFERS
 
 	NCDataset(rams_path, "r") do ds
 		for spec in context.specs
@@ -973,6 +980,8 @@ function normalize_thermals(;
 			rmprocs(worker_ids)
 		end
 	end
+	# Release this process's field buffers (only the in-process path fills them here)
+	empty!(_FIELD_BUFFERS)
 
 	# Stored per-thermal shape: (r, θ) after the φ reduction, or the full (r, θ, φ)
 	stored_shape =
