@@ -1,6 +1,6 @@
 using Interpolations: interpolate, Gridded, Linear, extrapolate
-using ProgressMeter: Progress, next!
-using OhMyThreads: @localize
+using ProgressMeter: Progress, progress_map, progress_pmap
+using Distributed: addprocs, rmprocs, CachingPool, remotecall_eval
 
 # ──────────────────────────────────────────────────────────────────
 # Spherical grid
@@ -205,47 +205,316 @@ function _spec_staggered_axis(spec::CompositeSpec)::Symbol
 	return only(axes)
 end
 
-function interpolate_timestep!(
-	result::Dict{String, Array{Float64, 3}},
-	rams_path::String,
-	specs::Vector{CompositeSpec},
-	subset::NamedTuple,
-	grid::SphericalGrid,
-	ts::ThermalTimeStep,
+"""
+	_timestep_subset(ts, rams_grid, r_norm_max)
+
+Native-grid index box around ONE thermal timestep: the thermal's center ± `r_norm_max` × its
+radius at that timestep, plus the one-cell interpolation margin that `coord_range` adds.
+
+This replaces the older per-TRACK box (the bounding box of the whole lifetime path, padded by
+the lifetime-maximum radius), which every timestep of the track then re-read. The
+per-timestep box is typically several times smaller, yet still holds every
+(r_norm ≤ r_norm_max) query point. `Gridded(Linear())` uses only the 8 native points around
+each query point, so a smaller box that still brackets every query point gives the same
+values. Query points beyond the domain edge extrapolate to NaN with either box.
+
+Each axis's index range is the union of the ranges that bracket the sphere on the thermo
+(scalar) coordinates AND on the momentum (staggered) coordinates. A staggered variable such
+as WC is sampled on the momentum levels, which sit half a cell away from the thermo levels.
+A range built from the thermo levels alone can therefore stop just short of the sphere's
+outermost points on the momentum levels, turning them into NaN. (The older per-track box hid
+this everywhere except at each track's extreme timesteps, where it produced such NaNs at the
+bottom of the r_norm ≈ 2 shell.)
+"""
+function _timestep_subset(ts::ThermalTimeStep, rams_grid, r_norm_max::Float64)
+	# Half-width of the box: the outermost normalized shell, in meters
+	half_extent = ts.sphere_radius * r_norm_max
+
+	# Index range bracketing [center - half_extent, center + half_extent] on both the
+	# thermo and the momentum coordinates of one axis
+	function bracketing_range(thermo_coords, momentum_coords, center)
+		thermo_ixs =
+			coord_range(thermo_coords, center - half_extent, center + half_extent)
+		momentum_ixs = coord_range(
+			momentum_coords,
+			center - half_extent,
+			center + half_extent,
+		)
+		return min(first(thermo_ixs), first(momentum_ixs)):max(
+			last(thermo_ixs),
+			last(momentum_ixs),
+		)
+	end
+
+	x_ixs = bracketing_range(rams_grid.x, rams_grid.xm, ts.center_x)
+	y_ixs = bracketing_range(rams_grid.y, rams_grid.ym, ts.center_y)
+	z_ixs = bracketing_range(rams_grid.z, rams_grid.zm, ts.center_z)
+
+	# Same layout as compute_spatial_subset: index ranges plus the coordinates they select
+	return (
+		x_ixs=x_ixs,
+		y_ixs=y_ixs,
+		z_ixs=z_ixs,
+		x_sub=rams_grid.x[x_ixs],
+		y_sub=rams_grid.y[y_ixs],
+		z_sub=rams_grid.z[z_ixs],
+		xm_sub=rams_grid.xm[x_ixs],
+		ym_sub=rams_grid.ym[y_ixs],
+		zm_sub=rams_grid.zm[z_ixs],
+	)
+end
+
+"""
+	_chunk_aligned_blocks(subsets, chunk_size_x, chunk_size_y, nx, ny)
+
+List the horizontal `(x_range, y_range)` index blocks to read so that every HDF5 chunk that
+any box in `subsets` touches is decompressed exactly ONCE.
+
+Why this matters: RAMS lite variables are stored in full-column chunks (all z levels × a
+small x–y tile), and HDF5 must decompress a whole chunk to return any part of it. The older
+thermal-major loop read each thermal's box separately, so a chunk shared by several thermals
+(or by consecutive reads) was decompressed again every time. Here the union of needed chunks
+is read once per file and variable, and each thermal's box is then cut from memory.
+
+Blocks are chunk-aligned, so no read straddles a chunk it does not need. Needed tiles that
+sit next to each other in x within one tile row (same y tile) merge into a single read,
+which cuts per-call overhead without decompressing anything extra.
+"""
+function _chunk_aligned_blocks(
+	subsets,
+	chunk_size_x::Int,
+	chunk_size_y::Int,
+	nx::Int,
+	ny::Int,
 )
-	rho = grid.R .* ts.sphere_radius
-	z_q = rho .* grid.cos_theta .+ ts.center_z
-	x_q = rho .* grid.sin_theta_cos_phi .+ ts.center_x
-	y_q = rho .* grid.sin_theta_sin_phi .+ ts.center_y
-
-	NCDataset(rams_path, "r") do ds
-		for spec in specs
-			# Sample staggered variables on their momentum axis and scalars on the thermo
-			# grid; only the staggered axis differs from the scalar coordinates. This places
-			# each input at its true C-grid location before interpolating to (r, θ, φ).
-			staggered_axis = _spec_staggered_axis(spec)
-			x_coords = staggered_axis === :x ? subset.xm_sub : subset.x_sub
-			y_coords = staggered_axis === :y ? subset.ym_sub : subset.y_sub
-			z_coords = staggered_axis === :z ? subset.zm_sub : subset.z_sub
-
-			# Read each input on the native subset grid, then combine into the field to
-			# interpolate. For a plain pass-through variable this is just the variable itself;
-			# for a derived variable the combination happens here, on the native grid.
-			native = Dict{String, Array{Float64, 3}}(
-				v => Float64.(ds[v][subset.x_ixs, subset.y_ixs, subset.z_ixs]) for v in spec.inputs
-			)
-			data_sub = spec.combine(native)
-
-			itp = interpolate(
-				(x_coords, y_coords, z_coords),
-				data_sub,
-				Gridded(Linear()),
-			)
-			eitp = extrapolate(itp, NaN)
-
-			result[spec.name] .= eitp.(x_q, y_q, z_q)
+	# Chunk tiles (0-based tile indices) that at least one subset box overlaps
+	needed_tiles = Set{Tuple{Int, Int}}()
+	for subset in subsets
+		tile_x_range =
+			((first(subset.x_ixs) - 1) ÷ chunk_size_x):((last(subset.x_ixs) - 1) ÷ chunk_size_x)
+		tile_y_range =
+			((first(subset.y_ixs) - 1) ÷ chunk_size_y):((last(subset.y_ixs) - 1) ÷ chunk_size_y)
+		for tile_x in tile_x_range, tile_y in tile_y_range
+			push!(needed_tiles, (tile_x, tile_y))
 		end
 	end
+
+	blocks = Tuple{UnitRange{Int}, UnitRange{Int}}[]
+	for tile_y in sort(unique(tile[2] for tile in needed_tiles))
+		# Native y indices covered by this tile row (the last row may be partial)
+		y_range = (tile_y * chunk_size_y + 1):min((tile_y + 1) * chunk_size_y, ny)
+
+		# Group this row's needed x tiles into runs of consecutive tiles
+		row_tiles_x = sort([tile[1] for tile in needed_tiles if tile[2] == tile_y])
+		run_start_tile = row_tiles_x[1]
+		previous_tile = run_start_tile
+		for tile_x in row_tiles_x[2:end]
+			if tile_x != previous_tile + 1
+				# The run ended at previous_tile: emit it and start a new run here
+				push!(
+					blocks,
+					(
+						(run_start_tile * chunk_size_x + 1):min((previous_tile + 1) * chunk_size_x, nx),
+						y_range,
+					),
+				)
+				run_start_tile = tile_x
+			end
+			previous_tile = tile_x
+		end
+		# Emit the row's final run
+		push!(
+			blocks,
+			(
+				(run_start_tile * chunk_size_x + 1):min((previous_tile + 1) * chunk_size_x, nx),
+				y_range,
+			),
+		)
+	end
+	return blocks
+end
+
+"""
+	_load_blocks(variable, blocks, field_buffer)
+
+Read `blocks` of `variable` (every z level) into a full-domain array, and return that array.
+
+`field_buffer` is reused when its element type matches what the variable returns; otherwise
+(or when it is `nothing`) a new full-domain array is allocated. Reuse avoids allocating a
+~300 MB array per variable per file. Cells outside `blocks` keep stale or uninitialized
+values, which is safe because callers only slice boxes that the blocks cover.
+
+Values are read through the same CF-variable indexing as the older per-box reads, so they
+are bitwise identical to what that code saw.
+"""
+function _load_blocks(variable, blocks, field_buffer)
+	for (x_range, y_range) in blocks
+		# Full columns: the chunks span every z level, so a z subset would not save work
+		block = variable[x_range, y_range, :]
+		if field_buffer === nothing || eltype(field_buffer) != eltype(block)
+			field_buffer = Array{eltype(block)}(undef, size(variable))
+		end
+		field_buffer[x_range, y_range, :] .= block
+	end
+	return field_buffer
+end
+
+"""
+	_normalize_one_file(rams_path, timesteps, context)
+
+Composite every thermal timestep in `timesteps`, all of which share the RAMS file
+`rams_path`.
+
+Mechanism: open the file once. For each composited quantity, decompress the union of chunks
+that any listed thermal's per-timestep box touches (see `_chunk_aligned_blocks`). Then, for
+each thermal, cut its box out of that in-memory field and run the unchanged per-thermal
+steps, in the same order as before:
+
+1. convert the box to Float64;
+2. clip the inputs listed in `context.nonnegative_vars` at zero;
+3. combine the inputs (a pass-through for a plain variable);
+4. interpolate linearly onto the thermal's (r, θ, φ) grid (NaN outside the domain);
+5. reduce over φ to a mean and a spread, when `context.azimuthal_average` is set.
+
+Only the source of the native values changes relative to the older thermal-major loop, so
+every output value is identical.
+
+This function is the unit of parallel work. Files are independent, so `normalize_thermals`
+hands one file at a time to each worker process.
+
+Returns `(mean, std)`. Each is a Dict from composite name to an array whose LAST axis
+indexes `timesteps`. `std` is `nothing` unless φ-averaging with the spread was requested.
+"""
+function _normalize_one_file(
+	rams_path::String,
+	timesteps::Vector{ThermalTimeStep},
+	context,
+)
+	grid = context.grid
+	n_timesteps = length(timesteps)
+
+	# Native-grid index box of each thermal at this time
+	subsets = [
+		_timestep_subset(ts, context.rams_grid, context.r_norm_max) for
+		ts in timesteps
+	]
+
+	# Model-coordinate positions of each thermal's (r, θ, φ) query points. The sphere is
+	# scaled by this timestep's radius and centered on this timestep's smoothed center.
+	query_points = map(timesteps) do ts
+		rho = grid.R .* ts.sphere_radius
+		(
+			x=rho .* grid.sin_theta_cos_phi .+ ts.center_x,
+			y=rho .* grid.sin_theta_sin_phi .+ ts.center_y,
+			z=rho .* grid.cos_theta .+ ts.center_z,
+		)
+	end
+
+	# Stored per-thermal shape: (r, θ) after the φ reduction, or the full (r, θ, φ)
+	stored_shape =
+		context.azimuthal_average ? (grid.n_r, grid.n_theta) :
+		(grid.n_r, grid.n_theta, grid.n_phi)
+	mean_by_name = Dict(
+		spec.name => Array{Float64}(undef, stored_shape..., n_timesteps) for
+		spec in context.specs
+	)
+	std_by_name =
+		context.azimuthal_average && context.include_azimuthal_std ?
+		Dict(
+			spec.name => Array{Float64}(undef, stored_shape..., n_timesteps) for
+			spec in context.specs
+		) : nothing
+
+	# Scratch array for one thermal's full (r, θ, φ) interpolation
+	interpolated = Array{Float64}(undef, grid.n_r, grid.n_theta, grid.n_phi)
+
+	# One reusable full-domain buffer per input POSITION within a spec. A derived spec needs
+	# all of its inputs in memory at once, so each position gets its own buffer.
+	field_buffers = Dict{Int, Any}()
+
+	NCDataset(rams_path, "r") do ds
+		for spec in context.specs
+			# Staggered inputs are sampled on their momentum axis, scalars on the thermo grid
+			staggered_axis = _spec_staggered_axis(spec)
+
+			# Decompress, once, every chunk that some thermal at this time needs
+			input_fields = Dict{String, Any}()
+			for (input_position, input_name) in enumerate(spec.inputs)
+				variable = ds[input_name]
+				nx, ny, _ = size(variable)
+				# Horizontal chunk tile size; a contiguous (unchunked) variable is one tile
+				storage, chunk_sizes = chunking(variable.var)
+				chunk_size_x, chunk_size_y =
+					storage === :chunked ? (chunk_sizes[1], chunk_sizes[2]) :
+					(nx, ny)
+				blocks = _chunk_aligned_blocks(
+					subsets,
+					chunk_size_x,
+					chunk_size_y,
+					nx,
+					ny,
+				)
+				field_buffers[input_position] = _load_blocks(
+					variable,
+					blocks,
+					get(field_buffers, input_position, nothing),
+				)
+				input_fields[input_name] = field_buffers[input_position]
+			end
+
+			for (timestep_index, (subset, query)) in
+				enumerate(zip(subsets, query_points))
+				# Native coordinates of this box, on the staggered axis where applicable
+				x_coords = staggered_axis === :x ? subset.xm_sub : subset.x_sub
+				y_coords = staggered_axis === :y ? subset.ym_sub : subset.y_sub
+				z_coords = staggered_axis === :z ? subset.zm_sub : subset.z_sub
+
+				# Cut this thermal's box out of the in-memory fields
+				native = Dict{String, Array{Float64, 3}}(
+					input_name => Float64.(
+						input_fields[input_name][
+							subset.x_ixs,
+							subset.y_ixs,
+							subset.z_ixs,
+						],
+					) for input_name in spec.inputs
+				)
+
+				# Clip non-negative inputs at zero BEFORE combining, so a derived total is
+				# summed from clipped species. Lossy compression turns true zeros into small
+				# values of either sign.
+				for input_name in spec.inputs
+					if input_name in context.nonnegative_vars
+						native[input_name] = max.(native[input_name], 0.0)
+					end
+				end
+
+				# Combine inputs into the field to interpolate (pass-through for plain vars)
+				data_sub = spec.combine(native)
+
+				# Linear interpolation onto the (r, θ, φ) query points; NaN outside the box
+				itp = interpolate(
+					(x_coords, y_coords, z_coords),
+					data_sub,
+					Gridded(Linear()),
+				)
+				eitp = extrapolate(itp, NaN)
+				interpolated .= eitp.(query.x, query.y, query.z)
+
+				if context.azimuthal_average
+					# Collapse φ to its mean (and spread) so only the (r, θ) profile is kept
+					phi_mean, phi_std = _azimuthal_mean_std(interpolated)
+					mean_by_name[spec.name][:, :, timestep_index] .= phi_mean
+					if std_by_name !== nothing
+						std_by_name[spec.name][:, :, timestep_index] .= phi_std
+					end
+				else
+					mean_by_name[spec.name][:, :, :, timestep_index] .= interpolated
+				end
+			end
+		end
+	end
+	return (mean_by_name, std_by_name)
 end
 
 """
@@ -305,10 +574,16 @@ Julia defVar dim tuples are the reverse of Python/ncdump/CDL order. With the ful
 is set the φ axis has already been collapsed, so the fields are 4D `(…, r_norm, theta)` and
 each also gets a `<var>_phi_std` companion (when `output_std` is provided) holding the
 azimuthal standard deviation as an anisotropy diagnostic.
+
+`output` and `output_std` are FUNCTIONS from a composite name to its dense
+`(dt, thermal, r, θ[, φ])` array, not stored arrays. The caller builds each dense array on
+demand from compact per-file results, so only one variable's dense array exists at a time.
+Holding every variable dense at once took ~57 GB for 45 variables, because most
+(dt, thermal) slots are empty: thermals have different lifetimes.
 """
 function _write_normalize_output(
 	path::String,
-	output::AbstractDict,
+	output::Function,
 	grid::SphericalGrid,
 	all_dt_seconds::Vector{Float64},
 	tracks::Vector{ThermalTrack},
@@ -318,7 +593,7 @@ function _write_normalize_output(
 	extra_names::Vector{String},
 	extra_attrs::Dict{String, Dict{String, Any}};
 	azimuthal_average::Bool,
-	output_std::Union{Nothing, AbstractDict}=nothing,
+	output_std::Union{Nothing, Function}=nothing,
 )
 	thermal_ixs = [t.thermal_ix for t in tracks]
 
@@ -389,7 +664,7 @@ function _write_normalize_output(
 		for var in composited_var_names
 			println("  Writing $var...")
 			v = defVar(ds, var, Float64, field_dims; fillvalue=NaN)
-			v[all_colons...] = permutedims(output[var], storage_to_defvar_perm)
+			v[all_colons...] = permutedims(output(var), storage_to_defvar_perm)
 
 			# Azimuthal-asymmetry companion field (φ-std), same shape as the averaged field.
 			if azimuthal_average && output_std !== nothing
@@ -404,7 +679,7 @@ function _write_normalize_output(
 					),
 				)
 				vstd[all_colons...] =
-					permutedims(output_std[var], storage_to_defvar_perm)
+					permutedims(output_std(var), storage_to_defvar_perm)
 			end
 		end
 	end
@@ -418,7 +693,8 @@ end
 """
 	normalize_thermals(; thermal_ds_path, rams_output_dir, rams_grid_path, output_path,
 						 composited_vars, n_r=20, n_theta=36, n_phi=72, r_norm_max=2.0,
-						 lite=true, azimuthal_average=true, include_azimuthal_std=true)
+						 lite=true, azimuthal_average=true, include_azimuthal_std=true,
+						 nonnegative_vars=String[], n_workers=1)
 
 Build a composite dataset in thermal-normalized spherical coordinates. For each
 thermal at each timestep, linearly interpolates RAMS data from the Cartesian
@@ -441,6 +717,29 @@ per-thermal azimuthal profiles, at 1/n_phi the memory of the full `(…, phi)` f
 cost of an n_phi× larger array. When averaging, `include_azimuthal_std` (default `true`)
 additionally writes a `<var>_phi_std` field holding the azimuthal standard deviation, a
 per-`(r, θ)` measure of how much azimuthal variation the mean is hiding.
+
+`nonnegative_vars` lists RAMS variables to clip at zero on the native grid before a spec
+combines its inputs (and so before interpolation). Lossy (ZFP) compression turns true zeros
+into small values of either sign; clipping restores them. A derived total is summed from
+clipped species.
+
+# How the work is organized (and why it is fast)
+
+The loop runs over RAMS FILES, not over thermals. Each file is opened once. For each
+composited variable, the union of HDF5 chunks that any thermal alive at that time needs is
+decompressed once, and each thermal's box is then cut from memory. The lite files store
+full-column chunks that HDF5 must decompress whole, so the older thermal-major loop spent
+most of its time decompressing the same chunks again for every thermal, timestep, and
+variable. Each thermal's box also now spans only that timestep's sphere, not the thermal's
+whole lifetime path. Neither change alters any output value (see `_normalize_one_file`).
+
+`n_workers > 1` processes files in parallel on that many worker processes (Distributed),
+which are started here and removed at the end. Threads would not help: NCDatasets serializes
+every NetCDF call behind one global lock. On a worker, each spec's `combine` function must
+be callable. The package's `composite`/`derived_sum` specs and anonymous functions defined in
+`Main` are fine, because Distributed serializes them by value. A combine function that calls
+another user-defined NAMED function or reads a global of the calling session will fail on
+the workers; use `n_workers=1` for those, or define them on the workers first.
 """
 function normalize_thermals(;
 	thermal_ds_path::AbstractString,
@@ -456,6 +755,8 @@ function normalize_thermals(;
 	azimuthal_average::Bool=true,
 	include_azimuthal_std::Bool=true,
 	scale_var::AbstractString="sphere_radius_azimuthal_smoothed",
+	nonnegative_vars=String[],
+	n_workers::Int=1,
 )
 	# Normalize each requested variable into a CompositeSpec: bare strings become pass-through
 	# specs; CompositeSpec entries (from derived/derived_sum) are kept as-is.
@@ -575,115 +876,129 @@ function normalize_thermals(;
 		(azimuthal_average && include_azimuthal_std ? " (+φ-std)" : ""),
 	)
 
-	# Composited-field storage. When averaging over φ the fields are 4D (dt, thermal, r, θ)
-	# and — if requested — an equally-shaped std field accumulates the azimuthal spread;
-	# otherwise the fields keep the full φ axis (dt, thermal, r, θ, φ).
-	if azimuthal_average
-		output = Dict(
-			name => fill(NaN, n_dt, n_thermals, grid.n_r, grid.n_theta) for
-			name in spec_names
+	# Every (thermal, timestep) with a RAMS file is one work item. Items are grouped by the
+	# RAMS file they read, so each file is opened and its chunks decompressed only once.
+	# `item_slot` and `item_dt_ix` record where each item lands in the (dt, thermal) layout.
+	item_timesteps = ThermalTimeStep[]
+	item_slot = Int[]
+	item_dt_ix = Int[]
+	item_ts_ix = Int[]
+	item_indices_by_time = Dict{DateTime, Vector{Int}}()
+	for (thermal_slot, track) in enumerate(tracks),
+		(ts_ix, ts) in enumerate(track.timesteps)
+		# Skip timesteps with no matching RAMS file (already reported in the warning above)
+		rams_file_available[ts.time] || continue
+		push!(item_timesteps, ts)
+		push!(item_slot, thermal_slot)
+		push!(item_dt_ix, dt_to_ix[ts.dt_thermal_seconds])
+		push!(item_ts_ix, ts_ix)
+		push!(
+			get!(item_indices_by_time, ts.time, Int[]),
+			length(item_timesteps),
 		)
-		output_std =
-			include_azimuthal_std ?
-			Dict(
-				name => fill(NaN, n_dt, n_thermals, grid.n_r, grid.n_theta) for
-				name in spec_names
-			) : nothing
-	else
-		output = Dict(
-			name => fill(
-				NaN,
-				n_dt,
-				n_thermals,
-				grid.n_r,
-				grid.n_theta,
-				grid.n_phi,
-			) for name in spec_names
-		)
-		output_std = nothing
 	end
+
+	# Per-(dt, thermal) metadata needs no RAMS data, so it is filled here directly
 	extras_2d = Dict{String, Matrix{Float64}}(
 		name => fill(NaN, n_dt, n_thermals) for name in extra_names
 	)
 	ref_time = DateTime(2000, 1, 1)
 	time_seconds_2d = fill(NaN, n_dt, n_thermals)
+	for item_index in eachindex(item_timesteps)
+		dt_ix = item_dt_ix[item_index]
+		thermal_slot = item_slot[item_index]
+		time_seconds_2d[dt_ix, thermal_slot] =
+			Dates.value(
+				Millisecond(item_timesteps[item_index].time - ref_time),
+			) / 1000.0
+		for name in extra_names
+			extras_2d[name][dt_ix, thermal_slot] =
+				extras[name][thermal_slot][item_ts_ix[item_index]]
+		end
+	end
 
-	n_threads = Threads.nthreads()
-	println("Processing thermals ($n_threads thread(s))...")
-	pbar = Progress(n_thermals; output=stdout)
-	pbar_lock = ReentrantLock()
+	# One job per RAMS file, in time order: (file path, the thermal timesteps it serves)
+	job_times = sort(collect(keys(item_indices_by_time)))
+	job_item_indices = [item_indices_by_time[t] for t in job_times]
+	jobs = [
+		(
+			datetime_to_rams_path(rams_output_dir, t, lite=lite),
+			item_timesteps[item_indices_by_time[t]],
+		) for t in job_times
+	]
 
-	# `output`, `output_std`, and `specs` each have two assignment sites in this function
-	# (the azimuthal_average if/else for output/output_std; `specs = kept_specs` above), so
-	# Julia boxes them, and OhMyThreads refuses boxed captures inside a @tasks closure. Localize
-	# them so each is a single-assignment local the closure captures unboxed. We only mutate the
-	# *contents* of output/output_std in the loop — never rebind them — so the outer bindings
-	# still see the writes for _write_normalize_output below.
-	@localize output output_std specs @tasks for thermal_slot in 1:n_thermals
-		# Per-task scratch buffer for the full (r, θ, φ) interpolation of each field; the φ
-		# reduction (if any) happens out of this buffer before storing into the output arrays.
-		@local buf = Dict(
-			name =>
-				Array{Float64}(undef, grid.n_r, grid.n_theta, grid.n_phi)
-			for name in spec_names
+	# Everything a worker needs besides its job. Composite specs travel inside it; a derived
+	# spec's combine function must therefore be callable on a worker (see the docstring).
+	context = (
+		specs=specs,
+		grid=grid,
+		rams_grid=gc,
+		r_norm_max=Float64(r_norm_max),
+		nonnegative_vars=Set{String}(String.(collect(nonnegative_vars))),
+		azimuthal_average=azimuthal_average,
+		include_azimuthal_std=include_azimuthal_std,
+	)
+	process_job = job -> _normalize_one_file(job[1], job[2], context)
+	progress = Progress(length(jobs); output=stdout)
+
+	results = if n_workers <= 1
+		println(
+			"Processing $(length(item_timesteps)) thermal timesteps in " *
+			"$(length(jobs)) RAMS files, in this process...",
 		)
-
-		track = tracks[thermal_slot]
-		# Pad the Cartesian bounding box out to the full normalized radius (r_norm_max × the
-		# thermal radius), so every query point on the (r_norm ≤ r_norm_max) sphere lies inside
-		# the subset. With a smaller pad the outer shells fall outside and interpolate to NaN.
-		# (coord_range already adds one grid cell on each side for the interpolation stencil.)
-		subset = compute_spatial_subset(
-			track,
-			gc.x,
-			gc.y,
-			gc.z;
-			pad=Float64(r_norm_max),
-			xm_coords=gc.xm,
-			ym_coords=gc.ym,
-			zm_coords=gc.zm,
+		progress_map(process_job, jobs; progress=progress)
+	else
+		println(
+			"Processing $(length(item_timesteps)) thermal timesteps in " *
+			"$(length(jobs)) RAMS files, on $n_workers worker processes...",
 		)
+		# Separate processes, not threads: NCDatasets serializes every NetCDF call behind one
+		# global lock, so threads would read one at a time. Workers inherit this process's
+		# environment (HDF5_PLUGIN_PATH, JULIA_DEPOT_PATH) and use the same project.
+		worker_ids = addprocs(
+			n_workers;
+			exeflags=["--project=$(Base.active_project())", "--threads=1"],
+		)
+		try
+			remotecall_eval(Main, worker_ids, :(using ThermalTracking))
+			# A CachingPool ships `process_job` (and the context it captures) to each worker
+			# once, instead of once per file
+			progress_pmap(
+				process_job,
+				CachingPool(worker_ids),
+				jobs;
+				progress=progress,
+			)
+		finally
+			rmprocs(worker_ids)
+		end
+	end
 
-		for (ts_ix, ts) in enumerate(track.timesteps)
-			# Skip timesteps with no matching RAMS file (already reported in the summary
-			# warning above); this is the common case when normalizing high-frequency tracks
-			# against lower-frequency full-analysis output.
-			rams_file_available[ts.time] || continue
-			rams_path =
-				datetime_to_rams_path(rams_output_dir, ts.time, lite=lite)
+	# Stored per-thermal shape: (r, θ) after the φ reduction, or the full (r, θ, φ)
+	stored_shape =
+		azimuthal_average ? (grid.n_r, grid.n_theta) :
+		(grid.n_r, grid.n_theta, grid.n_phi)
+	stored_colons = ntuple(_ -> Colon(), length(stored_shape))
 
-			interpolate_timestep!(buf, rams_path, specs, subset, grid, ts)
-
-			dt_ix = dt_to_ix[ts.dt_thermal_seconds]
-			for name in spec_names
-				if azimuthal_average
-					# Collapse φ to its mean (and spread) so only the (r, θ) profile is stored.
-					phi_mean, phi_std = _azimuthal_mean_std(buf[name])
-					output[name][dt_ix, thermal_slot, :, :] .= phi_mean
-					if include_azimuthal_std
-						output_std[name][dt_ix, thermal_slot, :, :] .= phi_std
-					end
-				else
-					output[name][dt_ix, thermal_slot, :, :, :] .= buf[name]
-				end
-			end
-			time_seconds_2d[dt_ix, thermal_slot] =
-				Dates.value(Millisecond(ts.time - ref_time)) / 1000.0
-			for name in extra_names
-				extras_2d[name][dt_ix, thermal_slot] =
-					extras[name][thermal_slot][ts_ix]
+	# Scatter one composite's per-file results into a dense NaN-filled (dt, thermal, …) array.
+	# `part` is 1 for the mean (or the full φ field) and 2 for the φ spread. Slots that no
+	# item fills (a thermal not alive at that dt) stay NaN, as in the original accumulator.
+	function assemble_dense(name::String, part::Int)
+		dense = fill(NaN, n_dt, n_thermals, stored_shape...)
+		for (item_indices, file_result) in zip(job_item_indices, results)
+			file_field = file_result[part][name]
+			for (local_index, item_index) in enumerate(item_indices)
+				dense[item_dt_ix[item_index], item_slot[item_index], stored_colons...] .=
+					selectdim(file_field, ndims(file_field), local_index)
 			end
 		end
-
-		lock(pbar_lock) do
-			next!(pbar)
-		end
+		return dense
 	end
 
 	println("Writing output to $output_path")
 	_write_normalize_output(
 		output_path,
-		output,
+		name -> assemble_dense(name, 1),
 		grid,
 		all_dt_seconds,
 		tracks,
@@ -693,7 +1008,8 @@ function normalize_thermals(;
 		extra_names,
 		extra_attrs;
 		azimuthal_average=azimuthal_average,
-		output_std=output_std,
+		output_std=azimuthal_average && include_azimuthal_std ?
+				   (name -> assemble_dense(name, 2)) : nothing,
 	)
 	println("Done.")
 	return nothing
