@@ -145,11 +145,15 @@ function datetime_to_rams_path(
 	joinpath(rams_dir, "a-$(lite ? "L" : "A")-$(datestr)-g1.h5")
 end
 
-"""Parse the datetime encoded in a RAMS filename of the form `a-L-YYYY-mm-dd-HHMMSS-g1.h5`."""
+"""
+Parse the datetime encoded in a RAMS filename of the form `a-L-YYYY-mm-dd-HHMMSS-g1.h5`
+(lite) or `a-A-YYYY-mm-dd-HHMMSS-g1.h5` (full-analysis). Both output kinds are accepted so
+the pipeline can be driven off either via a single `lite` flag.
+"""
 function rams_path_to_datetime(path::String)::DateTime
 	name = basename(path)
-	# name = a-L-YYYY-mm-dd-HHMMSS-g1.h5
-	m = match(r"^a-L-(\d{4})-(\d{2})-(\d{2})-(\d{6})-g1\.h5$", name)
+	# name = a-{L,A}-YYYY-mm-dd-HHMMSS-g1.h5 (lite or full-analysis)
+	m = match(r"^a-[LA]-(\d{4})-(\d{2})-(\d{2})-(\d{6})-g1\.h5$", name)
 	m === nothing &&
 		error("RAMS filename does not match expected pattern: $name")
 	y, mo, d, hms = m.captures
@@ -163,10 +167,19 @@ function rams_path_to_datetime(path::String)::DateTime
 	)
 end
 
-"""Enumerate RAMS lite files `a-L-*-g1.h5` in `dir`, sorted by datetime."""
-function list_rams_files(dir::String)::Vector{String}
+"""
+Enumerate RAMS files in `dir`, sorted by datetime. `lite=true` (default) lists the
+high-frequency lite files `a-L-*-g1.h5`; `lite=false` lists the full-analysis files
+`a-A-*-g1.h5`. Selecting the kind here lets a single top-level flag drive which output
+the whole tracking pipeline reads.
+"""
+function list_rams_files(dir::String; lite::Bool=true)::Vector{String}
 	all_files = readdir(dir; join=true)
-	rams = filter(p -> occursin(r"^a-L-.*-g1\.h5$", basename(p)), all_files)
+	file_kind_prefix = lite ? "a-L-" : "a-A-"
+	rams = filter(
+		p -> occursin(Regex("^$(file_kind_prefix).*-g1\\.h5\$"), basename(p)),
+		all_files,
+	)
 	sort!(rams; by=rams_path_to_datetime)
 	return rams
 end
@@ -202,12 +215,16 @@ RAMS HDF5 outputs only carry phony dimensions, not coord arrays.
 """
 function write_rams_grid(
 	rams_output_dir::AbstractString,
-	output_path::AbstractString,
+	output_path::AbstractString;
+	lite::Bool=true,
 )
 	rams_output_dir = String(rams_output_dir)
 	output_path = String(output_path)
 
-	files = list_rams_files(rams_output_dir)
+	# The grid coords come from the `-head.txt` paired with the first RAMS file; `lite`
+	# only picks which file kind we look for so the search works when a run has just one
+	# kind present (e.g. analysis-only). Both kinds share the same grid.
+	files = list_rams_files(rams_output_dir; lite=lite)
 	isempty(files) && error("No RAMS files found in $rams_output_dir")
 
 	header_path = replace(files[1], r"g\d+\.h5$" => "head.txt")

@@ -46,39 +46,45 @@ function _find_w_maxima_at_time(
 	threshold_abs::Real,
 	ix_counter::Ref{Int},
 )::Vector{WMaximum}
-	wc, uc, vc = NCDataset(rams_path, "r") do ds
-		(
-			Float32.(ds["WC"][:, :, :]),   # Julia shape (nx, ny, nz)
-			Float32.(ds["UC"][:, :, :]),
-			Float32.(ds["VC"][:, :, :]),
-		)
-	end
+	# Only WC is needed as a full field (peak finding scans all of it). UC/VC are read only at
+	# the discovered peak locations below, so we deliberately do NOT decompress them in full —
+	# that would decompress two ~full-domain fields per timestep just to sample a few points.
+	maxima = NCDataset(rams_path, "r") do ds
+		wc = Float32.(ds["WC"][:, :, :])   # Julia shape (nx, ny, nz)
 
-	# local_maxima_3d returns (i, j, k) == (ix_x, ix_y, ix_z) matching array layout
-	peaks = local_maxima_3d(
-		wc;
-		min_distance=min_distance_pixels,
-		threshold_abs=threshold_abs,
-	)
-
-	maxima = Vector{WMaximum}(undef, length(peaks))
-	@inbounds for (p_ix, (ix_x, ix_y, ix_z)) in enumerate(peaks)
-		ix_counter[] += 1
-		maxima[p_ix] = WMaximum(
-			ix_counter[],
-			time_ix,
-			time,
-			t_minutes,
-			x_coords[ix_x],
-			y_coords[ix_y],
-			z_coords[ix_z],
-			ix_x,
-			ix_y,
-			ix_z,
-			Float64(wc[ix_x, ix_y, ix_z]),
-			Float64(uc[ix_x, ix_y, ix_z]),
-			Float64(vc[ix_x, ix_y, ix_z]),
+		# local_maxima_3d returns (i, j, k) == (ix_x, ix_y, ix_z) matching array layout
+		peaks = local_maxima_3d(
+			wc;
+			min_distance=min_distance_pixels,
+			threshold_abs=threshold_abs,
 		)
+
+		# Handles to UC/VC for sparse, per-peak sampling (hyperslab reads decompress only the
+		# chunk(s) containing each peak, not the whole field).
+		uc_var = ds["UC"]
+		vc_var = ds["VC"]
+
+		peak_maxima = Vector{WMaximum}(undef, length(peaks))
+		for (p_ix, (ix_x, ix_y, ix_z)) in enumerate(peaks)
+			ix_counter[] += 1
+			# Sample U/V only at this peak's grid cell (same indices as the WC peak).
+			peak_maxima[p_ix] = WMaximum(
+				ix_counter[],
+				time_ix,
+				time,
+				t_minutes,
+				x_coords[ix_x],
+				y_coords[ix_y],
+				z_coords[ix_z],
+				ix_x,
+				ix_y,
+				ix_z,
+				Float64(wc[ix_x, ix_y, ix_z]),
+				Float64(uc_var[ix_x, ix_y, ix_z]),
+				Float64(vc_var[ix_x, ix_y, ix_z]),
+			)
+		end
+		peak_maxima
 	end
 	return maxima
 end
@@ -87,8 +93,19 @@ end
 # Chaining across time
 # ──────────────────────────────────────────────────────────────────
 
+"""
+Advance the chaining by one timestep. `cluster_by_last_ix` maps each *previous*-timestep
+maximum's `ix` to the cluster it belongs to. Returns the analogous map for `current_maxima`
+(each current maximum's `ix` → its cluster), to be passed in as `cluster_by_last_ix` next step.
+
+Maintaining this map incrementally (instead of rebuilding it over every cluster accumulated so
+far, each timestep) is what keeps the chain pass linear rather than quadratic in the total peak
+count: only the previous timestep's maxima are ever looked up, and each current maximum lands in
+exactly one cluster here, so we can record its mapping as we go.
+"""
 function _chain_step!(
 	w_clusters::Vector{WMaxCluster},
+	cluster_by_last_ix::Dict{Int, WMaxCluster},
 	last_maxima::Vector{WMaximum},
 	current_maxima::Vector{WMaximum},
 	timestep_seconds::Float64;
@@ -166,25 +183,28 @@ function _chain_step!(
 		end
 	end
 
-	# Index clusters by the ix of every maximum in them for O(1) lookup
-	cluster_by_wm_ix = Dict{Int, WMaxCluster}()
-	for c in w_clusters, wm in c.w_maxima
-		cluster_by_wm_ix[wm.ix] = c
-	end
-
+	# Assign each current maximum to a cluster and record its ix → cluster mapping for the next
+	# step. `m.from` is always a previous-timestep maximum, so its cluster is already in
+	# `cluster_by_last_ix` — no need to rebuild an index over every cluster.
+	cluster_by_current_ix = Dict{Int, WMaxCluster}()
 	matched_current_ixs = Set{Int}()
 	for m in matches
-		parent = cluster_by_wm_ix[m.from.ix]
+		parent = cluster_by_last_ix[m.from.ix]
 		push!(parent.w_maxima, m.to)
 		push!(matched_current_ixs, m.to.ix)
+		cluster_by_current_ix[m.to.ix] = parent
 	end
 
 	# Any unmatched current maximum starts a new cluster
 	for cm in current_maxima
 		if !(cm.ix in matched_current_ixs)
-			push!(w_clusters, WMaxCluster([cm]))
+			new_cluster = WMaxCluster([cm])
+			push!(w_clusters, new_cluster)
+			cluster_by_current_ix[cm.ix] = new_cluster
 		end
 	end
+
+	return cluster_by_current_ix
 end
 
 # ──────────────────────────────────────────────────────────────────
@@ -218,9 +238,13 @@ function chain_w_maxima(;
 	filter_by_horizontal_distance::Bool=true,
 	max_opposite_wind_displacement::Real=0.0,
 	peak_position_tolerance::Real=0.0,
+	lite::Bool=true,
 )
-	println("Listing RAMS files in $rams_output_dir")
-	files = list_rams_files(String(rams_output_dir))
+	# `lite` selects which RAMS output the chaining reads: lite (a-L-, default) or
+	# full-analysis (a-A-). Driven by the single top-level pipeline flag.
+	file_kind = lite ? "lite (a-L-)" : "full-analysis (a-A-)"
+	println("Listing $file_kind RAMS files in $rams_output_dir")
+	files = list_rams_files(String(rams_output_dir); lite=lite)
 	if !isnothing(limit)
 		files = files[1:limit]
 	end
@@ -247,6 +271,9 @@ function chain_w_maxima(;
 	w_clusters = WMaxCluster[]
 	ix_counter = Ref(0)
 	last_maxima = WMaximum[]
+	# Maps each previous-timestep maximum's ix to its cluster; maintained incrementally across
+	# timesteps so the chain step never rebuilds an index over all clusters seen so far.
+	cluster_by_last_ix = Dict{Int, WMaxCluster}()
 
 	pbar = Progress(length(files); output=stdout)
 	for (time_ix, path) in enumerate(files)
@@ -267,12 +294,17 @@ function chain_w_maxima(;
 		)
 
 		if time_ix == 1
+			# First timestep: every maximum seeds its own cluster; seed the ix → cluster map too.
+			empty!(cluster_by_last_ix)
 			for wm in current_maxima
-				push!(w_clusters, WMaxCluster([wm]))
+				new_cluster = WMaxCluster([wm])
+				push!(w_clusters, new_cluster)
+				cluster_by_last_ix[wm.ix] = new_cluster
 			end
 		else
-			_chain_step!(
+			cluster_by_last_ix = _chain_step!(
 				w_clusters,
+				cluster_by_last_ix,
 				last_maxima,
 				current_maxima,
 				timestep_seconds;

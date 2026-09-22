@@ -1,5 +1,6 @@
 using Interpolations: interpolate, Gridded, Linear, extrapolate
 using ProgressMeter: Progress, next!
+using OhMyThreads: @localize
 
 # ──────────────────────────────────────────────────────────────────
 # Spherical grid
@@ -92,14 +93,8 @@ function read_thermal_tracks(path::String; scale_var::String)
 
 		# Variables consumed directly (struct fields or output coords) — don't
 		# double-write them as propagated extras.
-		consumed = Set([
-			"x",
-			"y",
-			"z",
-			"dt_thermal_seconds",
-			"time",
-			"thermal_ix",
-		])
+		consumed =
+			Set(["x", "y", "z", "dt_thermal_seconds", "time", "thermal_ix"])
 		# Attributes the writer will set explicitly; copying them would clash.
 		skip_attrs = Set(["_FillValue", "missing_value"])
 
@@ -138,9 +133,12 @@ function read_thermal_tracks(path::String; scale_var::String)
 				z_val = get_val(z_all, di, ti)
 				dt_val = get_val(dt_all, di, ti)
 				any_missing_or_nan =
-					ismissing(sr) || isnan(Float64(sr)) ||
-					ismissing(x_val) || ismissing(y_val) ||
-					ismissing(z_val) || ismissing(dt_val)
+					ismissing(sr) ||
+					isnan(Float64(sr)) ||
+					ismissing(x_val) ||
+					ismissing(y_val) ||
+					ismissing(z_val) ||
+					ismissing(dt_val)
 				any_missing_or_nan && continue
 				push!(
 					timesteps,
@@ -234,8 +232,7 @@ function interpolate_timestep!(
 			# interpolate. For a plain pass-through variable this is just the variable itself;
 			# for a derived variable the combination happens here, on the native grid.
 			native = Dict{String, Array{Float64, 3}}(
-				v => Float64.(ds[v][subset.x_ixs, subset.y_ixs, subset.z_ixs])
-				for v in spec.inputs
+				v => Float64.(ds[v][subset.x_ixs, subset.y_ixs, subset.z_ixs]) for v in spec.inputs
 			)
 			data_sub = spec.combine(native)
 
@@ -458,12 +455,13 @@ function normalize_thermals(;
 	lite::Bool=true,
 	azimuthal_average::Bool=true,
 	include_azimuthal_std::Bool=true,
-	scale_var::AbstractString="sphere_radius_disk_smoothed",
+	scale_var::AbstractString="sphere_radius_azimuthal_smoothed",
 )
 	# Normalize each requested variable into a CompositeSpec: bare strings become pass-through
 	# specs; CompositeSpec entries (from derived/derived_sum) are kept as-is.
 	specs = CompositeSpec[
-		el isa CompositeSpec ? el : composite(String(el)) for el in composited_vars
+		el isa CompositeSpec ? el : composite(String(el)) for
+		el in composited_vars
 	]
 	thermal_ds_path = String(thermal_ds_path)
 	rams_output_dir = String(rams_output_dir)
@@ -495,12 +493,14 @@ function normalize_thermals(;
 	# thermal_ds times have no matching RAMS file, so we composite only the times where
 	# both the thermal tracks and the RAMS output are present. The existence check is done
 	# once here (and cached) so the hot loop below neither re-stats files nor warns per-file.
-	unique_track_times =
-		sort(collect(Set(ts.time for track in tracks for ts in track.timesteps)))
+	unique_track_times = sort(
+		collect(Set(ts.time for track in tracks for ts in track.timesteps)),
+	)
 	rams_file_available = Dict{DateTime, Bool}()
 	for track_time in unique_track_times
-		rams_file_available[track_time] =
-			isfile(datetime_to_rams_path(rams_output_dir, track_time, lite=lite))
+		rams_file_available[track_time] = isfile(
+			datetime_to_rams_path(rams_output_dir, track_time, lite=lite),
+		)
 	end
 	n_times_total = length(unique_track_times)
 	n_times_available = count(values(rams_file_available))
@@ -522,7 +522,8 @@ function normalize_thermals(;
 
 	# Use the first available time (not necessarily the first track's first timestep, which
 	# generally does not align with a full-analysis file) to discover variables and check dims.
-	first_available_time = first(t for t in unique_track_times if rams_file_available[t])
+	first_available_time =
+		first(t for t in unique_track_times if rams_file_available[t])
 	first_path =
 		datetime_to_rams_path(rams_output_dir, first_available_time, lite=lite)
 
@@ -539,7 +540,8 @@ function normalize_thermals(;
 		else
 			println(
 				"  Skipping composite '$(spec.name)': input(s) not present in " *
-				"$first_path: " * join(missing_inputs, ", "),
+				"$first_path: " *
+				join(missing_inputs, ", "),
 			)
 		end
 	end
@@ -578,20 +580,25 @@ function normalize_thermals(;
 	# otherwise the fields keep the full φ axis (dt, thermal, r, θ, φ).
 	if azimuthal_average
 		output = Dict(
-			name => fill(NaN, n_dt, n_thermals, grid.n_r, grid.n_theta)
-			for name in spec_names
+			name => fill(NaN, n_dt, n_thermals, grid.n_r, grid.n_theta) for
+			name in spec_names
 		)
 		output_std =
 			include_azimuthal_std ?
 			Dict(
-				name => fill(NaN, n_dt, n_thermals, grid.n_r, grid.n_theta)
-				for name in spec_names
+				name => fill(NaN, n_dt, n_thermals, grid.n_r, grid.n_theta) for
+				name in spec_names
 			) : nothing
 	else
 		output = Dict(
-			name =>
-				fill(NaN, n_dt, n_thermals, grid.n_r, grid.n_theta, grid.n_phi)
-			for name in spec_names
+			name => fill(
+				NaN,
+				n_dt,
+				n_thermals,
+				grid.n_r,
+				grid.n_theta,
+				grid.n_phi,
+			) for name in spec_names
 		)
 		output_std = nothing
 	end
@@ -606,7 +613,13 @@ function normalize_thermals(;
 	pbar = Progress(n_thermals; output=stdout)
 	pbar_lock = ReentrantLock()
 
-	@tasks for thermal_slot in 1:n_thermals
+	# `output`, `output_std`, and `specs` each have two assignment sites in this function
+	# (the azimuthal_average if/else for output/output_std; `specs = kept_specs` above), so
+	# Julia boxes them, and OhMyThreads refuses boxed captures inside a @tasks closure. Localize
+	# them so each is a single-assignment local the closure captures unboxed. We only mutate the
+	# *contents* of output/output_std in the loop — never rebind them — so the outer bindings
+	# still see the writes for _write_normalize_output below.
+	@localize output output_std specs @tasks for thermal_slot in 1:n_thermals
 		# Per-task scratch buffer for the full (r, θ, φ) interpolation of each field; the φ
 		# reduction (if any) happens out of this buffer before storing into the output arrays.
 		@local buf = Dict(

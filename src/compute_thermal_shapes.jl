@@ -749,6 +749,7 @@ function _compute_shapes_for_thermal!(
 	out::NamedTuple,
 	traj::_TrajInput,
 	rams_output_dir::String,
+	lite::Bool,
 	gc,
 	dx::Float64,
 	dy::Float64,
@@ -784,7 +785,7 @@ function _compute_shapes_for_thermal!(
 		z_ixs = findall(abs.(gc.z .- center_z) .<= z_half_extent)
 		(isempty(x_ixs) || isempty(y_ixs) || isempty(z_ixs)) && continue
 
-		rams_path = datetime_to_rams_path(rams_output_dir, traj.times[ti])
+		rams_path = datetime_to_rams_path(rams_output_dir, traj.times[ti]; lite=lite)
 		isfile(rams_path) || (@warn "RAMS file not found: $rams_path"; continue)
 
 		wc_sub = lock(_NC_IO_LOCK) do
@@ -850,7 +851,7 @@ end
 							 output_path, max_radius=3000.0, max_z_semi_axis=3000.0,
 							 min_prominence_fraction=0.05, uniform_z_semi_axis_grid_spacing=50.0,
 							 edge_cell_bins_per_dim=4, n_azimuth=72,
-							 azimuthal_radial_spacing=nothing)
+							 azimuthal_radial_spacing=nothing, lite=true)
 
 For each thermal/timestep, fit `w_tr = (WC − z_propagation_speed)` around the *smoothed*
 thermal center and record several boundary estimates:
@@ -863,6 +864,9 @@ thermal center and record several boundary estimates:
 All thermals are kept; usability is a per-quantity `out_of_domain_*` flag (true ⟺ that shape
 exits the RAMS domain). `n_azimuth` sets the azimuthal-average resolution;
 `azimuthal_radial_spacing` its radial cell size (defaults to the horizontal grid spacing).
+
+`lite` selects which RAMS output to read the WC field from: lite (`a-L-`, default) or
+full-analysis (`a-A-`). It must match the file kind the trajectories were tracked on.
 """
 function compute_thermal_shapes(;
 	thermal_trajectories_path::AbstractString,
@@ -876,7 +880,10 @@ function compute_thermal_shapes(;
 	edge_cell_bins_per_dim::Integer=4,
 	n_azimuth::Integer=72,
 	azimuthal_radial_spacing::Union{Nothing, Real}=nothing,
+	lite::Bool=true,
 )
+	# `lite` selects which RAMS output the shape fits read: lite (a-L-, default) or
+	# full-analysis (a-A-). Driven by the single top-level pipeline flag.
 	println("Reading trajectories from $thermal_trajectories_path")
 	tr = _read_trajectories(String(thermal_trajectories_path))
 	n_time = length(tr.times)
@@ -934,7 +941,7 @@ function compute_thermal_shapes(;
 	any_path = ""
 	for t in trajs, (i, v) in enumerate(t.valid)
 		v || continue
-		p = datetime_to_rams_path(String(rams_output_dir), t.times[i])
+		p = datetime_to_rams_path(String(rams_output_dir), t.times[i]; lite=lite)
 		if isfile(p)
 			any_path = p
 			break
@@ -961,6 +968,7 @@ function compute_thermal_shapes(;
 			),
 			trajs[ti],
 			String(rams_output_dir),
+			lite,
 			gc,
 			dx,
 			dy,
