@@ -13,6 +13,14 @@ Algorithm:
 
 `min_distance` is interpreted in *pixels*, isotropically — matching the Python
 behavior on stretched-z grids.
+
+Step 1 runs only on the bounding box of the above-threshold cells, padded by `md` on every
+side and clipped to the array. Only above-threshold cells can become candidates. The
+dilation window of such a cell reaches at most `md` cells in each direction, and that
+window lies inside the padded box, so every candidate sees the same dilated value as a
+full-array dilation. Updrafts above threshold fill a small part of a RAMS domain (in the
+tracer_soundings run, about 17% of the volume, and only the lowest ~40% of levels), so the
+crop cuts the dilation cost several-fold.
 """
 function local_maxima_3d(
 	image::AbstractArray{T, 3};
@@ -21,19 +29,45 @@ function local_maxima_3d(
 )::Vector{NTuple{3, Int}} where {T}
 	md = min_distance
 
-	# Step 1: separable 1D max filter along each axis (Lemire monotonic-deque,
-	# amortized O(N) per line). Benchmarks at ~0.04s per 200×200×300 timestep
-	# vs ~6s for three `mapwindow(maximum, ...)` passes.
-	dilated = _dilate_3d(image, md)
-
-	# Step 2: collect (value, i, j, k) for plateau-top pixels above threshold
+	# Bounding box of the cells that meet the threshold; with none, there are no peaks
 	thr = T(threshold_abs)
 	sz = size(image)
-	candidates = Tuple{T, Int, Int, Int}[]
+	box_lo = [typemax(Int), typemax(Int), typemax(Int)]
+	box_hi = [0, 0, 0]
 	@inbounds for k in 1:sz[3], j in 1:sz[2], i in 1:sz[1]
-		v = image[i, j, k]
+		image[i, j, k] >= thr || continue
+		for (dim, index) in enumerate((i, j, k))
+			box_lo[dim] = min(box_lo[dim], index)
+			box_hi[dim] = max(box_hi[dim], index)
+		end
+	end
+	box_hi[1] == 0 && return NTuple{3, Int}[]
+
+	# Pad the box by the dilation half-width so every candidate's window lies inside it
+	crop_ranges = ntuple(
+		dim -> max(1, box_lo[dim] - md):min(sz[dim], box_hi[dim] + md),
+		3,
+	)
+	cropped_image = image[crop_ranges...]
+	# Offset that converts a cropped-array index back to a full-array index
+	crop_offsets = ntuple(dim -> first(crop_ranges[dim]) - 1, 3)
+
+	# Step 1: separable 1D max filter along each axis (Lemire monotonic-deque,
+	# amortized O(N) per line), on the cropped box only.
+	dilated = _dilate_3d(cropped_image, md)
+
+	# Step 2: collect (value, i, j, k) for plateau-top pixels above threshold, in full-array
+	# indices. The loop visits cells in the same (k, j, i) order as a full-array scan, so
+	# the candidate order, and hence the tie order in the sort below, is unchanged.
+	cropped_size = size(cropped_image)
+	candidates = Tuple{T, Int, Int, Int}[]
+	@inbounds for k in 1:cropped_size[3], j in 1:cropped_size[2], i in 1:cropped_size[1]
+		v = cropped_image[i, j, k]
 		if v >= thr && v == dilated[i, j, k]
-			push!(candidates, (v, i, j, k))
+			push!(
+				candidates,
+				(v, i + crop_offsets[1], j + crop_offsets[2], k + crop_offsets[3]),
+			)
 		end
 	end
 

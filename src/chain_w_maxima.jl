@@ -1,4 +1,4 @@
-using ProgressMeter: Progress, next!
+using ProgressMeter: Progress
 
 # ──────────────────────────────────────────────────────────────────
 # Internal dataclasses
@@ -34,6 +34,33 @@ end
 # Per-timestep peak extraction
 # ──────────────────────────────────────────────────────────────────
 
+# Full-domain UC and VC buffers, kept alive across files in this process so that each file
+# does not allocate fresh ~300 MB arrays. Every process (the main one, or each Distributed
+# worker) has its own copy of this module global, and each process runs one file at a time,
+# so no locking is needed. `chain_w_maxima` empties it when it finishes.
+const _PEAK_WIND_BUFFERS = Dict{String, Any}()
+
+"""
+	_find_w_maxima_at_time(rams_path, time_ix, time, t_minutes, x_coords, y_coords,
+						   z_coords; min_distance_pixels, threshold_abs)
+
+Find the WC local maxima in one RAMS file, and sample UC and VC at each one. Returns the
+maxima as `WMaximum`s with `ix = 0`; the caller numbers them, because the numbering is
+global across files and this function sees only one file.
+
+Mechanism:
+1. Read the full WC field, because peak finding scans all of it. The raw variable is read
+   (no CF decoding), which is exact because the RAMS lite variables carry no fill, scale,
+   or offset attributes.
+2. Find the peaks with `local_maxima_3d`.
+3. Read UC and VC only in the chunks that hold a peak. Lite chunks span the full column
+   and are larger than HDF5's chunk cache, so a separate point read per peak would
+   decompress a shared chunk again for each peak in it. `_chunk_aligned_blocks` lists each
+   needed chunk once, and `_load_blocks` decompresses it once.
+
+This function is the unit of parallel work: files are independent, so `chain_w_maxima`
+hands one file at a time to each worker process.
+"""
 function _find_w_maxima_at_time(
 	rams_path::String,
 	time_ix::Int,
@@ -44,13 +71,10 @@ function _find_w_maxima_at_time(
 	z_coords::Vector{Float64};
 	min_distance_pixels::Int,
 	threshold_abs::Real,
-	ix_counter::Ref{Int},
 )::Vector{WMaximum}
-	# Only WC is needed as a full field (peak finding scans all of it). UC/VC are read only at
-	# the discovered peak locations below, so we deliberately do NOT decompress them in full —
-	# that would decompress two ~full-domain fields per timestep just to sample a few points.
-	maxima = NCDataset(rams_path, "r") do ds
-		wc = Float32.(ds["WC"][:, :, :])   # Julia shape (nx, ny, nz)
+	NCDataset(rams_path, "r") do ds
+		# Full WC field, Julia shape (nx, ny, nz)
+		wc = ds["WC"].var[:, :, :]
 
 		# local_maxima_3d returns (i, j, k) == (ix_x, ix_y, ix_z) matching array layout
 		peaks = local_maxima_3d(
@@ -58,18 +82,42 @@ function _find_w_maxima_at_time(
 			min_distance=min_distance_pixels,
 			threshold_abs=threshold_abs,
 		)
+		isempty(peaks) && return WMaximum[]
 
-		# Handles to UC/VC for sparse, per-peak sampling (hyperslab reads decompress only the
-		# chunk(s) containing each peak, not the whole field).
-		uc_var = ds["UC"]
-		vc_var = ds["VC"]
+		# One single-cell box per peak, so the block reader decompresses each chunk that
+		# holds a peak exactly once
+		peak_cell_boxes = [(x_ixs=ix_x:ix_x, y_ixs=ix_y:ix_y) for (ix_x, ix_y, _) in peaks]
 
-		peak_maxima = Vector{WMaximum}(undef, length(peaks))
-		for (p_ix, (ix_x, ix_y, ix_z)) in enumerate(peaks)
-			ix_counter[] += 1
-			# Sample U/V only at this peak's grid cell (same indices as the WC peak).
-			peak_maxima[p_ix] = WMaximum(
-				ix_counter[],
+		# U and V at the peaks, from the chunks that hold them
+		wind_at_peaks = Dict{String, Vector{Float64}}()
+		for wind_name in ("UC", "VC")
+			variable = ds[wind_name]
+			nx, ny, _ = size(variable)
+			# Horizontal chunk tile size; a contiguous (unchunked) variable is one tile
+			storage, chunk_sizes = chunking(variable.var)
+			chunk_size_x, chunk_size_y =
+				storage === :chunked ? (chunk_sizes[1], chunk_sizes[2]) : (nx, ny)
+			blocks = _chunk_aligned_blocks(
+				peak_cell_boxes,
+				chunk_size_x,
+				chunk_size_y,
+				nx,
+				ny,
+			)
+			wind_field = _load_blocks(
+				variable,
+				blocks,
+				get(_PEAK_WIND_BUFFERS, wind_name, nothing),
+			)
+			_PEAK_WIND_BUFFERS[wind_name] = wind_field
+			wind_at_peaks[wind_name] =
+				[Float64(wind_field[ix_x, ix_y, ix_z]) for (ix_x, ix_y, ix_z) in peaks]
+		end
+
+		# One WMaximum per peak, in peak order; the caller assigns the global ix
+		[
+			WMaximum(
+				0,
 				time_ix,
 				time,
 				t_minutes,
@@ -80,13 +128,30 @@ function _find_w_maxima_at_time(
 				ix_y,
 				ix_z,
 				Float64(wc[ix_x, ix_y, ix_z]),
-				Float64(uc_var[ix_x, ix_y, ix_z]),
-				Float64(vc_var[ix_x, ix_y, ix_z]),
-			)
-		end
-		peak_maxima
+				wind_at_peaks["UC"][peak_ix],
+				wind_at_peaks["VC"][peak_ix],
+			) for (peak_ix, (ix_x, ix_y, ix_z)) in enumerate(peaks)
+		]
 	end
-	return maxima
+end
+
+"""Copy of `wm` with its global index set to `ix` (WMaximum is immutable)."""
+function _with_ix(wm::WMaximum, ix::Int)::WMaximum
+	WMaximum(
+		ix,
+		wm.time_ix,
+		wm.time,
+		wm.t_minutes,
+		wm.x,
+		wm.y,
+		wm.z,
+		wm.x_ix,
+		wm.y_ix,
+		wm.z_ix,
+		wm.w,
+		wm.u,
+		wm.v,
+	)
 end
 
 # ──────────────────────────────────────────────────────────────────
@@ -214,7 +279,7 @@ end
 """
 	chain_w_maxima(; rams_output_dir, rams_grid_path, output_path,
 					 min_distance, threshold_abs,
-					 peak_position_tolerance)
+					 peak_position_tolerance, n_workers=1)
 
 Find updraft (`WC`) maxima at each RAMS timestep and chain them across time into
 clusters. Writes a flat per-peak table to `output_path`.
@@ -227,6 +292,9 @@ clusters. Writes a flat per-peak table to `output_path`.
   for absorbing peak-detection wobble when the detected W max jumps between
   nearby grid cells within a broad updraft core. Default `0.0` preserves the
   pre-tolerance behavior.
+- `n_workers > 1` finds each file's maxima in parallel on that many worker processes (see
+  `_map_over_workers`). The chaining then runs in time order in this process, and its result
+  does not depend on `n_workers`.
 """
 function chain_w_maxima(;
 	rams_output_dir::AbstractString,
@@ -239,6 +307,7 @@ function chain_w_maxima(;
 	max_opposite_wind_displacement::Real=0.0,
 	peak_position_tolerance::Real=0.0,
 	lite::Bool=true,
+	n_workers::Integer=1,
 )
 	# `lite` selects which RAMS output the chaining reads: lite (a-L-, default) or
 	# full-analysis (a-A-). Driven by the single top-level pipeline flag.
@@ -268,31 +337,61 @@ function chain_w_maxima(;
 	timestep_seconds = Float64(Dates.value(Millisecond(t1 - t0))) / 1000.0
 	println("  Timestep: $(timestep_seconds) s")
 
+	# Find every file's maxima first. Peak finding in one file does not depend on any other
+	# file, so it runs on worker processes when n_workers > 1. Only the chaining below has
+	# to run in time order, and it is cheap.
+	jobs = [
+		(
+			path=path,
+			time_ix=time_ix,
+			time=rams_path_to_datetime(path),
+			t_minutes=Float64(
+				Dates.value(Millisecond(rams_path_to_datetime(path) - t0)),
+			) / 60_000.0,
+		) for (time_ix, path) in enumerate(files)
+	]
+	println(
+		"  Finding W maxima in $(length(files)) files" *
+		(n_workers <= 1 ? ", in this process…" : ", on $n_workers worker processes…"),
+	)
+	# The grid coordinates are captured here so that the closure carries them to workers
+	x_coords, y_coords, z_coords = gc.x, gc.y, gc.z
+	process_job =
+		job -> _find_w_maxima_at_time(
+			job.path,
+			job.time_ix,
+			job.time,
+			job.t_minutes,
+			x_coords,
+			y_coords,
+			z_coords;
+			min_distance_pixels=min_distance_pixels,
+			threshold_abs=threshold_abs,
+		)
+	maxima_by_file = _map_over_workers(
+		process_job,
+		jobs;
+		n_workers=n_workers,
+		progress=Progress(length(files); output=stdout),
+	)
+	# Release this process's U/V buffers (only the in-process path fills them here)
+	empty!(_PEAK_WIND_BUFFERS)
+
+	# Number the maxima globally, in file order and then peak order within a file
+	ix_counter = 0
+	for file_maxima in maxima_by_file, peak_ix in eachindex(file_maxima)
+		ix_counter += 1
+		file_maxima[peak_ix] = _with_ix(file_maxima[peak_ix], ix_counter)
+	end
+
+	# Chain the maxima across time
 	w_clusters = WMaxCluster[]
-	ix_counter = Ref(0)
 	last_maxima = WMaximum[]
 	# Maps each previous-timestep maximum's ix to its cluster; maintained incrementally across
 	# timesteps so the chain step never rebuilds an index over all clusters seen so far.
 	cluster_by_last_ix = Dict{Int, WMaxCluster}()
 
-	pbar = Progress(length(files); output=stdout)
-	for (time_ix, path) in enumerate(files)
-		time = rams_path_to_datetime(path)
-		t_minutes = Float64(Dates.value(Millisecond(time - t0))) / 60_000.0
-
-		current_maxima = _find_w_maxima_at_time(
-			path,
-			time_ix,
-			time,
-			t_minutes,
-			gc.x,
-			gc.y,
-			gc.z;
-			min_distance_pixels=min_distance_pixels,
-			threshold_abs=threshold_abs,
-			ix_counter=ix_counter,
-		)
-
+	for (time_ix, current_maxima) in enumerate(maxima_by_file)
 		if time_ix == 1
 			# First timestep: every maximum seeds its own cluster; seed the ix → cluster map too.
 			empty!(cluster_by_last_ix)
@@ -315,7 +414,6 @@ function chain_w_maxima(;
 		end
 
 		last_maxima = current_maxima
-		next!(pbar)
 	end
 
 	n_clusters = length(w_clusters)
