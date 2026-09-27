@@ -1,6 +1,5 @@
 using Interpolations: interpolate, Gridded, Linear, extrapolate
-using ProgressMeter: Progress, progress_map, progress_pmap
-using Distributed: addprocs, rmprocs, CachingPool, remotecall_eval
+using ProgressMeter: Progress
 
 # ──────────────────────────────────────────────────────────────────
 # Spherical grid
@@ -262,101 +261,6 @@ function _timestep_subset(ts::ThermalTimeStep, rams_grid, r_norm_max::Float64)
 		ym_sub=rams_grid.ym[y_ixs],
 		zm_sub=rams_grid.zm[z_ixs],
 	)
-end
-
-"""
-	_chunk_aligned_blocks(subsets, chunk_size_x, chunk_size_y, nx, ny)
-
-List the horizontal `(x_range, y_range)` index blocks to read so that every HDF5 chunk that
-any box in `subsets` touches is decompressed exactly ONCE.
-
-Why this matters: RAMS lite variables are stored in full-column chunks (all z levels × a
-small x–y tile), and HDF5 must decompress a whole chunk to return any part of it. The older
-thermal-major loop read each thermal's box separately, so a chunk shared by several thermals
-(or by consecutive reads) was decompressed again every time. Here the union of needed chunks
-is read once per file and variable, and each thermal's box is then cut from memory.
-
-Blocks are chunk-aligned, so no read straddles a chunk it does not need. Needed tiles that
-sit next to each other in x within one tile row (same y tile) merge into a single read,
-which cuts per-call overhead without decompressing anything extra.
-"""
-function _chunk_aligned_blocks(
-	subsets,
-	chunk_size_x::Int,
-	chunk_size_y::Int,
-	nx::Int,
-	ny::Int,
-)
-	# Chunk tiles (0-based tile indices) that at least one subset box overlaps
-	needed_tiles = Set{Tuple{Int, Int}}()
-	for subset in subsets
-		tile_x_range =
-			((first(subset.x_ixs) - 1) ÷ chunk_size_x):((last(subset.x_ixs) - 1) ÷ chunk_size_x)
-		tile_y_range =
-			((first(subset.y_ixs) - 1) ÷ chunk_size_y):((last(subset.y_ixs) - 1) ÷ chunk_size_y)
-		for tile_x in tile_x_range, tile_y in tile_y_range
-			push!(needed_tiles, (tile_x, tile_y))
-		end
-	end
-
-	blocks = Tuple{UnitRange{Int}, UnitRange{Int}}[]
-	for tile_y in sort(unique(tile[2] for tile in needed_tiles))
-		# Native y indices covered by this tile row (the last row may be partial)
-		y_range = (tile_y * chunk_size_y + 1):min((tile_y + 1) * chunk_size_y, ny)
-
-		# Group this row's needed x tiles into runs of consecutive tiles
-		row_tiles_x = sort([tile[1] for tile in needed_tiles if tile[2] == tile_y])
-		run_start_tile = row_tiles_x[1]
-		previous_tile = run_start_tile
-		for tile_x in row_tiles_x[2:end]
-			if tile_x != previous_tile + 1
-				# The run ended at previous_tile: emit it and start a new run here
-				push!(
-					blocks,
-					(
-						(run_start_tile * chunk_size_x + 1):min((previous_tile + 1) * chunk_size_x, nx),
-						y_range,
-					),
-				)
-				run_start_tile = tile_x
-			end
-			previous_tile = tile_x
-		end
-		# Emit the row's final run
-		push!(
-			blocks,
-			(
-				(run_start_tile * chunk_size_x + 1):min((previous_tile + 1) * chunk_size_x, nx),
-				y_range,
-			),
-		)
-	end
-	return blocks
-end
-
-"""
-	_load_blocks(variable, blocks, field_buffer)
-
-Read `blocks` of `variable` (every z level) into a full-domain array, and return that array.
-
-`field_buffer` is reused when its element type matches what the variable returns; otherwise
-(or when it is `nothing`) a new full-domain array is allocated. Reuse avoids allocating a
-~300 MB array per variable per file. Cells outside `blocks` keep stale or uninitialized
-values, which is safe because callers only slice boxes that the blocks cover.
-
-Values are read through the same CF-variable indexing as the older per-box reads, so they
-are bitwise identical to what that code saw.
-"""
-function _load_blocks(variable, blocks, field_buffer)
-	for (x_range, y_range) in blocks
-		# Full columns: the chunks span every z level, so a z subset would not save work
-		block = variable[x_range, y_range, :]
-		if field_buffer === nothing || eltype(field_buffer) != eltype(block)
-			field_buffer = Array{eltype(block)}(undef, size(variable))
-		end
-		field_buffer[x_range, y_range, :] .= block
-	end
-	return field_buffer
 end
 
 # Full-domain field buffers, one per input POSITION within a spec, kept alive across files
@@ -984,38 +888,17 @@ function normalize_thermals(;
 	process_job = job -> _normalize_one_file(job[1], job[2], context)
 	progress = Progress(length(jobs); output=stdout)
 
-	results = if n_workers <= 1
-		println(
-			"Processing $(length(item_timesteps)) thermal timesteps in " *
-			"$(length(jobs)) RAMS files, in this process...",
-		)
-		progress_map(process_job, jobs; progress=progress)
-	else
-		println(
-			"Processing $(length(item_timesteps)) thermal timesteps in " *
-			"$(length(jobs)) RAMS files, on $n_workers worker processes...",
-		)
-		# Separate processes, not threads: NCDatasets serializes every NetCDF call behind one
-		# global lock, so threads would read one at a time. Workers inherit this process's
-		# environment (HDF5_PLUGIN_PATH, JULIA_DEPOT_PATH) and use the same project.
-		worker_ids = addprocs(
-			n_workers;
-			exeflags=["--project=$(Base.active_project())", "--threads=1"],
-		)
-		try
-			remotecall_eval(Main, worker_ids, :(using ThermalTracking))
-			# A CachingPool ships `process_job` (and the context it captures) to each worker
-			# once, instead of once per file
-			progress_pmap(
-				process_job,
-				CachingPool(worker_ids),
-				jobs;
-				progress=progress,
-			)
-		finally
-			rmprocs(worker_ids)
-		end
-	end
+	println(
+		"Processing $(length(item_timesteps)) thermal timesteps in " *
+		"$(length(jobs)) RAMS files" *
+		(n_workers <= 1 ? ", in this process..." : ", on $n_workers worker processes..."),
+	)
+	results = _map_over_workers(
+		process_job,
+		jobs;
+		n_workers=n_workers,
+		progress=progress,
+	)
 	# Release this process's field buffers (only the in-process path fills them here)
 	empty!(_FIELD_BUFFERS)
 
