@@ -7,6 +7,7 @@ using ProgressMeter
 using OhMyThreads: @tasks, @set, @local
 
 include("io.jl")
+include("thermodynamics.jl")
 include("peak_finding.jl")
 include("chain_w_maxima.jl")
 include("smooth_trajectories.jl")
@@ -24,6 +25,8 @@ export chain_w_maxima,
     write_rams_grid,
     composite,
     derived,
-    derived_sum
+    derived_sum,
+    derived_supersaturation,
+    derived_supersaturated_flag
 
 end
