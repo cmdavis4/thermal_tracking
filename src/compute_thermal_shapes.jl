@@ -735,110 +735,183 @@ end
 # Per-thermal shape computation
 # ──────────────────────────────────────────────────────────────────
 
-# HDF5 / libnetcdf are not guaranteed to be thread-safe — concurrent opens from parallel
-# tasks can segfault the kernel. Serialize NetCDF reads through this lock; the fitting
-# (the expensive part) still runs in parallel.
-const _NC_IO_LOCK = ReentrantLock()
+"""
+Index box around one thermal center that holds every cell any shape fit can use: the
+largest sphere (±`max_radius` in x and y) and the full ellipse sweep (±`z_half_extent` in
+z). Returns `(x_ixs, y_ixs, z_ixs)` as unit ranges, or `nothing` if any range is empty.
 
+The coordinates are sorted ascending, so each "within the half-extent" index set is one
+contiguous run, and a unit range represents it exactly.
 """
-Fit all boundary quantities for one thermal, writing into the per-thermal output views in
-`out` (a NamedTuple of length-n_time vectors: `disk`, `sphere3d`, `azimuthal`, and the four
-half-ellipse semi-axes `up_int`, `lo_int`, `up_2nd`, `lo_2nd`).
-"""
-function _compute_shapes_for_thermal!(
-	out::NamedTuple,
-	traj::_TrajInput,
-	rams_output_dir::String,
-	lite::Bool,
+function _shape_fit_box(
 	gc,
-	dx::Float64,
-	dy::Float64,
-	dz::Float64,
-	r_coords::Vector{Float64},
-	dr::Float64,
-	n_azimuth::Int,
+	center_x::Float64,
+	center_y::Float64,
+	center_z::Float64,
 	max_radius::Float64,
-	max_z_semi_axis::Float64,
-	min_prominence_fraction::Float64,
-	uniform_z_semi_axis_grid_spacing::Float64,
-	edge_cell_bins_per_dim::Int,
+	z_half_extent::Float64,
 )
-	# The box must cover the largest sphere (±max_radius in every direction) and the full
-	# ellipse sweep (±max_z_semi_axis vertically); pad z by one cell for boundary sub-cells.
-	z_half_extent = max(max_radius, max_z_semi_axis) + dz
-	for ti in 1:length(traj.times)
-		traj.valid[ti] || continue
-		center_x = traj.x[ti]
-		center_y = traj.y[ti]
-		center_z = traj.z[ti]
-		z_prop = traj.z_prop[ti]
-		(
-			isnan(center_x) ||
-			isnan(center_y) ||
-			isnan(center_z) ||
-			isnan(z_prop)
-		) && continue
+	# Indices of the grid cells within the half-extent of the center, per axis
+	x_ixs = findall(abs.(gc.x .- center_x) .<= max_radius)
+	y_ixs = findall(abs.(gc.y .- center_y) .<= max_radius)
+	z_ixs = findall(abs.(gc.z .- center_z) .<= z_half_extent)
+	(isempty(x_ixs) || isempty(y_ixs) || isempty(z_ixs)) && return nothing
+	return (
+		x_ixs=first(x_ixs):last(x_ixs),
+		y_ixs=first(y_ixs):last(y_ixs),
+		z_ixs=first(z_ixs):last(z_ixs),
+	)
+end
 
-		# Bounding-box subset around the center. WC lives on the RAMS grid levels gc.z.
-		x_ixs = findall(abs.(gc.x .- center_x) .<= max_radius)
-		y_ixs = findall(abs.(gc.y .- center_y) .<= max_radius)
-		z_ixs = findall(abs.(gc.z .- center_z) .<= z_half_extent)
-		(isempty(x_ixs) || isempty(y_ixs) || isempty(z_ixs)) && continue
+"""
+Fit every boundary quantity for one thermal at one timestep, from `wc_box`, the WC values
+in that thermal's fit box (see `_shape_fit_box`). Returns a NamedTuple with the three sphere
+radii (`disk`, `sphere3d`, `azimuthal`) and the four half-ellipse semi-axes (`up_int`,
+`lo_int`, `up_2nd`, `lo_2nd`). A quantity that cannot be fit is `NaN`.
 
-		rams_path = datetime_to_rams_path(rams_output_dir, traj.times[ti]; lite=lite)
-		isfile(rams_path) || (@warn "RAMS file not found: $rams_path"; continue)
+The steps, in order:
+1. shift to the thermal's translating frame, `w_tr = WC − z_propagation_speed`;
+2. sphere 1, the 2-D disk zero-crossing at the w-max level;
+3. sphere 2, the 3-D volume zero-crossing over the raw grid cells;
+4. the azimuthal average `w_tr(r, z)`, which sphere 3 and the ellipses share;
+5. sphere 3, the volume zero-crossing on that azimuthal average;
+6. the four ellipse semi-axes, with horizontal semi-axis fixed at sphere 3's radius. They
+   are skipped (left `NaN`) when sphere 3 has no radius.
+"""
+function _fit_shapes_at_timestep(
+	wc_box::AbstractArray{Float32, 3},
+	box,
+	center_x::Float64,
+	center_y::Float64,
+	center_z::Float64,
+	z_prop::Float64,
+	context,
+)
+	gc = context.gc
 
-		wc_sub = lock(_NC_IO_LOCK) do
-			NCDataset(rams_path, "r") do ds
-				Float32.(ds["WC"][x_ixs, y_ixs, z_ixs])
-			end
+	# w in the thermal's translating frame: w_tr = WC − z_propagation_speed
+	w_field = wc_box .- Float32(z_prop)
+	x_coords_sub = gc.x[box.x_ixs]
+	y_coords_sub = gc.y[box.y_ixs]
+	z_coords_sub = gc.z[box.z_ixs]
+
+	# ── Sphere 1: 2-D disk zero-crossing at the w-max level ──
+	disk = _find_zero_crossing_disk_radius(
+		w_field, center_x, center_y, center_z,
+		x_coords_sub, y_coords_sub, z_coords_sub, context.dx, context.dy;
+		max_radius=context.max_radius,
+		edge_cell_bins_per_dim=context.edge_cell_bins_per_dim,
+	)
+
+	# ── Sphere 2: full 3-D volume zero-crossing over the raw grid cells ──
+	sphere3d = _find_zero_crossing_sphere_radius_3d(
+		w_field, center_x, center_y, center_z,
+		x_coords_sub, y_coords_sub, z_coords_sub, context.dx, context.dy, context.dz;
+		max_radius=context.max_radius,
+	)
+
+	# ── Azimuthal average w_tr(r, z), shared by sphere 3 and the ellipses ──
+	w_rz = _azimuthal_average_w_tr(
+		w_field, x_coords_sub, y_coords_sub, center_x, center_y,
+		context.r_coords, context.n_azimuth,
+	)
+
+	# ── Sphere 3: volume zero-crossing on the azimuthal average ──
+	azimuthal = _find_zero_crossing_sphere_radius_azimuthal(
+		w_rz, context.r_coords, z_coords_sub, context.dr, context.dz, center_z,
+		context.max_radius;
+		edge_cell_bins_per_dim=context.edge_cell_bins_per_dim,
+	)
+
+	# ── Ellipses on the azimuthal average, fixed a = sphere_radius_azimuthal ──
+	if isnan(azimuthal)
+		return (
+			disk=disk, sphere3d=sphere3d, azimuthal=azimuthal,
+			up_int=NaN, lo_int=NaN, up_2nd=NaN, lo_2nd=NaN,
+		)
+	end
+	semi_axes = _ellipse_semi_axes_azimuthal(
+		w_rz, context.r_coords, z_coords_sub, context.dr, context.dz, center_z, azimuthal;
+		max_z_semi_axis=context.max_z_semi_axis,
+		min_prominence_fraction=context.min_prominence_fraction,
+		uniform_grid_spacing=context.uniform_z_semi_axis_grid_spacing,
+		edge_cell_bins_per_dim=context.edge_cell_bins_per_dim,
+	)
+	return (
+		disk=disk,
+		sphere3d=sphere3d,
+		azimuthal=azimuthal,
+		up_int=semi_axes.upper_integral,
+		lo_int=semi_axes.lower_integral,
+		up_2nd=semi_axes.upper_2nd,
+		lo_2nd=semi_axes.lower_2nd,
+	)
+end
+
+# Full-domain WC buffer, kept alive across files in this process so that each file does not
+# allocate a fresh ~300 MB array. Every process (the main one, or each Distributed worker)
+# has its own copy of this module global, and each process runs one file at a time, so no
+# locking is needed. `compute_thermal_shapes` empties it when it finishes.
+const _SHAPE_WC_BUFFER = Ref{Any}(nothing)
+
+"""
+	_fit_shapes_in_one_file(rams_path, items, context)
+
+Fit every thermal that is alive at one RAMS output time, all of which share `rams_path`.
+Each entry of `items` is one thermal at this time: its fit box and its smoothed center and
+vertical propagation speed. Returns one `_fit_shapes_at_timestep` result per item, in order.
+
+Mechanism: open the file once, and decompress, once, the union of WC chunks that any item's
+fit box touches (`_chunk_aligned_blocks`). Then cut each item's box out of that in-memory
+field and fit it.
+
+Why this is faster than the older thermal-major loop: lite chunks span the full column, so
+HDF5 must decompress a whole column tile to return any part of it. About 25 thermals are
+alive at each time, and their boxes overlap. The older loop read each thermal's box
+separately, so shared chunks were decompressed again for each thermal. The values each fit
+sees are unchanged, because `_load_blocks` reads through the same CF-variable indexing.
+
+This function is the unit of parallel work. Files are independent, so
+`compute_thermal_shapes` hands one file at a time to each worker process.
+"""
+function _fit_shapes_in_one_file(rams_path::String, items, context)
+	NCDataset(rams_path, "r") do ds
+		variable = ds["WC"]
+		nx, ny, _ = size(variable)
+
+		# Horizontal chunk tile size; a contiguous (unchunked) variable is one tile
+		storage, chunk_sizes = chunking(variable.var)
+		chunk_size_x, chunk_size_y =
+			storage === :chunked ? (chunk_sizes[1], chunk_sizes[2]) : (nx, ny)
+
+		# Decompress, once, every chunk that some thermal's fit box needs
+		blocks = _chunk_aligned_blocks(
+			[item.box for item in items],
+			chunk_size_x,
+			chunk_size_y,
+			nx,
+			ny,
+		)
+		wc_field = _load_blocks(variable, blocks, _SHAPE_WC_BUFFER[])
+		_SHAPE_WC_BUFFER[] = wc_field
+
+		# Fit each thermal from its box of the in-memory field. The field is only read here,
+		# so the thermals can be fit on parallel tasks when this process has threads.
+		fitted = Vector{Any}(undef, length(items))
+		@tasks for item_ix in eachindex(items)
+			item = items[item_ix]
+			wc_box = Float32.(wc_field[item.box.x_ixs, item.box.y_ixs, item.box.z_ixs])
+			fitted[item_ix] = _fit_shapes_at_timestep(
+				wc_box,
+				item.box,
+				item.center_x,
+				item.center_y,
+				item.center_z,
+				item.z_prop,
+				context,
+			)
 		end
-
-		# w in the thermal's translating frame: w_tr = WC − z_propagation_speed
-		w_field = wc_sub .- Float32(z_prop)
-		x_coords_sub = gc.x[x_ixs]
-		y_coords_sub = gc.y[y_ixs]
-		z_coords_sub = gc.z[z_ixs]
-
-		# ── Sphere 1: 2-D disk zero-crossing at the w-max level ──
-		out.disk[ti] = _find_zero_crossing_disk_radius(
-			w_field, center_x, center_y, center_z,
-			x_coords_sub, y_coords_sub, z_coords_sub, dx, dy;
-			max_radius=max_radius, edge_cell_bins_per_dim=edge_cell_bins_per_dim,
-		)
-
-		# ── Sphere 2: full 3-D volume zero-crossing over the raw grid cells ──
-		out.sphere3d[ti] = _find_zero_crossing_sphere_radius_3d(
-			w_field, center_x, center_y, center_z,
-			x_coords_sub, y_coords_sub, z_coords_sub, dx, dy, dz;
-			max_radius=max_radius,
-		)
-
-		# ── Azimuthal average w_tr(r, z), shared by sphere 3 and the ellipses ──
-		w_rz = _azimuthal_average_w_tr(
-			w_field, x_coords_sub, y_coords_sub, center_x, center_y, r_coords, n_azimuth,
-		)
-
-		# ── Sphere 3: volume zero-crossing on the azimuthal average ──
-		r_azimuthal = _find_zero_crossing_sphere_radius_azimuthal(
-			w_rz, r_coords, z_coords_sub, dr, dz, center_z, max_radius;
-			edge_cell_bins_per_dim=edge_cell_bins_per_dim,
-		)
-		out.azimuthal[ti] = r_azimuthal
-
-		# ── Ellipses on the azimuthal average, fixed a = sphere_radius_azimuthal ──
-		isnan(r_azimuthal) && continue
-		semi_axes = _ellipse_semi_axes_azimuthal(
-			w_rz, r_coords, z_coords_sub, dr, dz, center_z, r_azimuthal;
-			max_z_semi_axis=max_z_semi_axis,
-			min_prominence_fraction=min_prominence_fraction,
-			uniform_grid_spacing=uniform_z_semi_axis_grid_spacing,
-			edge_cell_bins_per_dim=edge_cell_bins_per_dim,
-		)
-		out.up_int[ti] = semi_axes.upper_integral
-		out.lo_int[ti] = semi_axes.lower_integral
-		out.up_2nd[ti] = semi_axes.upper_2nd
-		out.lo_2nd[ti] = semi_axes.lower_2nd
+		return fitted
 	end
 end
 
@@ -851,7 +924,7 @@ end
 							 output_path, max_radius=3000.0, max_z_semi_axis=3000.0,
 							 min_prominence_fraction=0.05, uniform_z_semi_axis_grid_spacing=50.0,
 							 edge_cell_bins_per_dim=4, n_azimuth=72,
-							 azimuthal_radial_spacing=nothing, lite=true)
+							 azimuthal_radial_spacing=nothing, lite=true, n_workers=1)
 
 For each thermal/timestep, fit `w_tr = (WC − z_propagation_speed)` around the *smoothed*
 thermal center and record several boundary estimates:
@@ -867,6 +940,10 @@ exits the RAMS domain). `n_azimuth` sets the azimuthal-average resolution;
 
 `lite` selects which RAMS output to read the WC field from: lite (`a-L-`, default) or
 full-analysis (`a-A-`). It must match the file kind the trajectories were tracked on.
+
+The loop is file-major: each RAMS file's WC chunks are decompressed once, and every thermal
+alive at that time is fit from memory (see `_fit_shapes_in_one_file`). `n_workers > 1` runs
+files in parallel on that many worker processes (see `_map_over_workers`).
 """
 function compute_thermal_shapes(;
 	thermal_trajectories_path::AbstractString,
@@ -881,6 +958,7 @@ function compute_thermal_shapes(;
 	n_azimuth::Integer=72,
 	azimuthal_radial_spacing::Union{Nothing, Real}=nothing,
 	lite::Bool=true,
+	n_workers::Integer=1,
 )
 	# `lite` selects which RAMS output the shape fits read: lite (a-L-, default) or
 	# full-analysis (a-A-). Driven by the single top-level pipeline flag.
@@ -950,40 +1028,94 @@ function compute_thermal_shapes(;
 	any_path != "" || error("No RAMS files found for any trajectory timestep")
 	verify_rams_dims(any_path, gc.x, gc.y, gc.z, "WC")
 
-	# Parallel over thermals
-	println("Computing thermal shapes on $(Threads.nthreads()) threads…")
-	pbar = Progress(n_thermals; output=stdout)
-	pbar_lock = ReentrantLock()
+	# Everything a fit needs besides its thermal and its WC box. It travels to each worker.
+	# The box must cover the largest sphere (±max_radius in every direction) and the full
+	# ellipse sweep (±max_z_semi_axis vertically); pad z by one cell for boundary sub-cells.
+	context = (
+		gc=gc,
+		dx=dx,
+		dy=dy,
+		dz=dz,
+		r_coords=r_coords,
+		dr=dr,
+		n_azimuth=Int(n_azimuth),
+		max_radius=Float64(max_radius),
+		z_half_extent=max(Float64(max_radius), Float64(max_z_semi_axis)) + dz,
+		max_z_semi_axis=Float64(max_z_semi_axis),
+		min_prominence_fraction=Float64(min_prominence_fraction),
+		uniform_z_semi_axis_grid_spacing=Float64(uniform_z_semi_axis_grid_spacing),
+		edge_cell_bins_per_dim=Int(edge_cell_bins_per_dim),
+	)
 
-	@tasks for ti in 1:n_thermals
-		_compute_shapes_for_thermal!(
-			(
-				disk=view(sphere_radius_disk, :, ti),
-				sphere3d=view(sphere_radius_3d, :, ti),
-				azimuthal=view(sphere_radius_azimuthal, :, ti),
-				up_int=view(z_semi_axis_upper_integral, :, ti),
-				lo_int=view(z_semi_axis_lower_integral, :, ti),
-				up_2nd=view(z_semi_axis_upper_second_derivative, :, ti),
-				lo_2nd=view(z_semi_axis_lower_second_derivative, :, ti),
-			),
-			trajs[ti],
-			String(rams_output_dir),
-			lite,
-			gc,
-			dx,
-			dy,
-			dz,
-			r_coords,
-			dr,
-			Int(n_azimuth),
-			Float64(max_radius),
-			Float64(max_z_semi_axis),
-			Float64(min_prominence_fraction),
-			Float64(uniform_z_semi_axis_grid_spacing),
-			Int(edge_cell_bins_per_dim),
+	# One job per RAMS output time, in time order: the file, and every thermal alive then
+	jobs = []
+	job_slots = Vector{Tuple{Int, Vector{Int}}}()
+	for time_ix in 1:n_time
+		# Thermals alive at this time, with a fit box that overlaps the domain
+		items = []
+		thermal_columns = Int[]
+		for thermal_column in 1:n_thermals
+			traj = trajs[thermal_column]
+			traj.valid[time_ix] || continue
+			box = _shape_fit_box(
+				gc,
+				traj.x[time_ix],
+				traj.y[time_ix],
+				traj.z[time_ix],
+				context.max_radius,
+				context.z_half_extent,
+			)
+			box === nothing && continue
+			push!(
+				items,
+				(
+					box=box,
+					center_x=traj.x[time_ix],
+					center_y=traj.y[time_ix],
+					center_z=traj.z[time_ix],
+					z_prop=traj.z_prop[time_ix],
+				),
+			)
+			push!(thermal_columns, thermal_column)
+		end
+		isempty(items) && continue
+
+		# Skip (with a warning) a time whose RAMS file is missing; its fits stay NaN
+		rams_path = datetime_to_rams_path(
+			String(rams_output_dir), tr.times[time_ix]; lite=lite,
 		)
-		lock(pbar_lock) do
-			next!(pbar)
+		isfile(rams_path) || (@warn "RAMS file not found: $rams_path"; continue)
+		push!(jobs, (rams_path, items))
+		push!(job_slots, (time_ix, thermal_columns))
+	end
+
+	# Fit every file's thermals, on worker processes when n_workers > 1
+	n_items = sum(length(job[2]) for job in jobs; init=0)
+	println(
+		"Fitting $n_items thermal timesteps in $(length(jobs)) RAMS files" *
+		(n_workers <= 1 ? ", in this process…" : ", on $n_workers worker processes…"),
+	)
+	process_job = job -> _fit_shapes_in_one_file(job[1], job[2], context)
+	results = _map_over_workers(
+		process_job,
+		jobs;
+		n_workers=n_workers,
+		progress=Progress(length(jobs); output=stdout),
+	)
+	# Release this process's WC buffer (only the in-process path fills it here)
+	_SHAPE_WC_BUFFER[] = nothing
+
+	# Scatter each file's fits into the (time, thermal) matrices
+	for (job_ix, (time_ix, thermal_columns)) in enumerate(job_slots)
+		for (item_ix, thermal_column) in enumerate(thermal_columns)
+			fit = results[job_ix][item_ix]
+			sphere_radius_disk[time_ix, thermal_column] = fit.disk
+			sphere_radius_3d[time_ix, thermal_column] = fit.sphere3d
+			sphere_radius_azimuthal[time_ix, thermal_column] = fit.azimuthal
+			z_semi_axis_upper_integral[time_ix, thermal_column] = fit.up_int
+			z_semi_axis_lower_integral[time_ix, thermal_column] = fit.lo_int
+			z_semi_axis_upper_second_derivative[time_ix, thermal_column] = fit.up_2nd
+			z_semi_axis_lower_second_derivative[time_ix, thermal_column] = fit.lo_2nd
 		end
 	end
 
