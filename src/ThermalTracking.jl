@@ -26,6 +26,7 @@ export chain_w_maxima,
     composite,
     derived,
     derived_sum,
+    horizontal_wind_component,
     derived_supersaturation,
     derived_supersaturated_flag
 

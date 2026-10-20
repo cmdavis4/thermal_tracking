@@ -42,6 +42,54 @@ function build_spherical_grid(n_r, n_theta, n_phi, r_norm_max)::SphericalGrid
 end
 
 # ──────────────────────────────────────────────────────────────────
+# Direction-dependent boundary radii
+# ──────────────────────────────────────────────────────────────────
+
+"""
+	read_boundary_radii(path, grid)
+
+Read a file of direction-dependent thermal boundary radii into a lookup from
+`(thermal_ix, time)` to an `(n_theta, n_phi)` radius matrix.
+
+The file (written by `thermals.watershed_boundaries` in the thermals repository) is indexed by
+sample, not by thermal and time, because only a small share of all (thermal, time) pairs hold a
+thermal. Python dimensions: `boundary_radius(sample, theta, phi)` in meters,
+`sample_thermal_ix(sample)`, and `sample_time(sample)`, with `theta` and `phi` coordinates.
+NCDatasets reverses the dimension order, so Julia reads `boundary_radius` as
+`(phi, theta, sample)`.
+
+The file's directions must be the normalization grid's own (same θ and φ values), because each
+radius is applied to the grid direction it was measured along. A sample with any NaN radius (no
+boundary found) is left out of the lookup, so the normalization skips it.
+"""
+function read_boundary_radii(path::String, grid)
+	NCDataset(path, "r") do ds
+		file_theta = Array(ds["theta"])
+		file_phi = Array(ds["phi"])
+		(
+			length(file_theta) == grid.n_theta &&
+			length(file_phi) == grid.n_phi &&
+			maximum(abs.(file_theta .- grid.theta_vals)) < 1e-6 &&
+			maximum(abs.(file_phi .- grid.phi_vals)) < 1e-6
+		) || error(
+			"The boundary radii in $path are on a different (θ, φ) grid than the " *
+			"normalization (n_theta=$(grid.n_theta), n_phi=$(grid.n_phi)).",
+		)
+		radii = Array(ds["boundary_radius"])
+		thermal_ixs = Array(ds["sample_thermal_ix"])
+		times = Array(ds["sample_time"])
+		lookup = Dict{Tuple{Int, DateTime}, Matrix{Float64}}()
+		for sample in eachindex(thermal_ixs)
+			# (phi, theta) as stored -> (theta, phi), the grid's order
+			radius_matrix = permutedims(Float64.(coalesce.(radii[:, :, sample], NaN)))
+			any(isnan, radius_matrix) && continue
+			lookup[(Int(thermal_ixs[sample]), times[sample])] = radius_matrix
+		end
+		return lookup
+	end
+end
+
+# ──────────────────────────────────────────────────────────────────
 # Thermal track reader
 # ──────────────────────────────────────────────────────────────────
 
@@ -59,8 +107,12 @@ Returns `(tracks, extras, extra_names, extra_attrs)`:
 
 NCDatasets reverses dimension order from Python/ncdump convention.
 For thermal_ds.nc with Python dims (thermal_ix, time), Julia sees (time, thermal_ix).
+
+With a `boundary_lookup` (from `read_boundary_radii`), each timestep's direction-dependent radii
+come from the lookup, and a timestep that is not in it is skipped, together with its extras.
+Without one, every timestep is a sphere of radius `scale_var`.
 """
-function read_thermal_tracks(path::String; scale_var::String)
+function read_thermal_tracks(path::String; scale_var::String, boundary_lookup=nothing)
 	NCDataset(path, "r") do ds
 		thermal_ixs = Array(ds["thermal_ix"])
 		time_vals = Array(ds["time"])
@@ -139,6 +191,13 @@ function read_thermal_tracks(path::String; scale_var::String)
 					ismissing(z_val) ||
 					ismissing(dt_val)
 				any_missing_or_nan && continue
+				# Direction-dependent radii, when given; a timestep without them is skipped
+				boundary_radius = fill(Float64(sr), 1, 1)
+				if boundary_lookup !== nothing
+					key = (Int(thermal_ixs[ti]), time_vals[di])
+					haskey(boundary_lookup, key) || continue
+					boundary_radius = boundary_lookup[key]
+				end
 				push!(
 					timesteps,
 					ThermalTimeStep(
@@ -148,6 +207,7 @@ function read_thermal_tracks(path::String; scale_var::String)
 						Float64(sr),
 						Float64(dt_val),
 						time_vals[di],
+						boundary_radius,
 					),
 				)
 				for name in extra_names
@@ -205,10 +265,11 @@ function _spec_staggered_axis(spec::CompositeSpec)::Symbol
 end
 
 """
-	_timestep_subset(ts, rams_grid, r_norm_max)
+	_timestep_subset(ts, rams_grid, r_norm_max, grid)
 
-Native-grid index box around ONE thermal timestep: the thermal's center ± `r_norm_max` × its
-radius at that timestep, plus the one-cell interpolation margin that `coord_range` adds.
+Native-grid index box around ONE thermal timestep: on each axis, from the lowest to the highest
+offset of the outermost normalized shell (`r_norm_max` times the boundary radius in each grid
+direction), plus the one-cell interpolation margin that `coord_range` adds.
 
 This replaces the older per-TRACK box (the bounding box of the whole lifetime path, padded by
 the lifetime-maximum radius), which every timestep of the track then re-read. The
@@ -225,29 +286,34 @@ outermost points on the momentum levels, turning them into NaN. (The older per-t
 this everywhere except at each track's extreme timesteps, where it produced such NaNs at the
 bottom of the r_norm ≈ 2 shell.)
 """
-function _timestep_subset(ts::ThermalTimeStep, rams_grid, r_norm_max::Float64)
-	# Half-width of the box: the outermost normalized shell, in meters
-	half_extent = ts.sphere_radius * r_norm_max
+function _timestep_subset(ts::ThermalTimeStep, rams_grid, r_norm_max::Float64, grid::SphericalGrid)
+	# Reach of the outermost normalized shell along each axis, on each side of the center (m).
+	# The shell's point in direction (θ, φ) lies r_norm_max R(θ, φ) away along that direction,
+	# so its offset along x is r_norm_max R(θ, φ) sin θ cos φ, and likewise for y and z. The box
+	# spans the smallest to the largest of those offsets. For a sphere (one radius in every
+	# direction) that is ±r_norm_max R on every axis, because the grid holds the directions along
+	# ±x, ±y, and ±z. For a direction-dependent boundary the box follows the boundary's shape:
+	# a long ray downward extends only the bottom of the box.
+	shell_radius = r_norm_max .* reshape(ts.boundary_radius, 1, size(ts.boundary_radius)...)
+	offsets_x = shell_radius .* grid.sin_theta_cos_phi
+	offsets_y = shell_radius .* grid.sin_theta_sin_phi
+	offsets_z = shell_radius .* grid.cos_theta
 
-	# Index range bracketing [center - half_extent, center + half_extent] on both the
+	# Index range bracketing [center + lowest offset, center + highest offset] on both the
 	# thermo and the momentum coordinates of one axis
-	function bracketing_range(thermo_coords, momentum_coords, center)
-		thermo_ixs =
-			coord_range(thermo_coords, center - half_extent, center + half_extent)
-		momentum_ixs = coord_range(
-			momentum_coords,
-			center - half_extent,
-			center + half_extent,
-		)
+	function bracketing_range(thermo_coords, momentum_coords, center, offsets)
+		low, high = center + minimum(offsets), center + maximum(offsets)
+		thermo_ixs = coord_range(thermo_coords, low, high)
+		momentum_ixs = coord_range(momentum_coords, low, high)
 		return min(first(thermo_ixs), first(momentum_ixs)):max(
 			last(thermo_ixs),
 			last(momentum_ixs),
 		)
 	end
 
-	x_ixs = bracketing_range(rams_grid.x, rams_grid.xm, ts.center_x)
-	y_ixs = bracketing_range(rams_grid.y, rams_grid.ym, ts.center_y)
-	z_ixs = bracketing_range(rams_grid.z, rams_grid.zm, ts.center_z)
+	x_ixs = bracketing_range(rams_grid.x, rams_grid.xm, ts.center_x, offsets_x)
+	y_ixs = bracketing_range(rams_grid.y, rams_grid.ym, ts.center_y, offsets_y)
+	z_ixs = bracketing_range(rams_grid.z, rams_grid.zm, ts.center_z, offsets_z)
 
 	# Same layout as compute_spatial_subset: index ranges plus the coordinates they select
 	return (
@@ -306,14 +372,16 @@ function _normalize_one_file(
 
 	# Native-grid index box of each thermal at this time
 	subsets = [
-		_timestep_subset(ts, context.rams_grid, context.r_norm_max) for
+		_timestep_subset(ts, context.rams_grid, context.r_norm_max, grid) for
 		ts in timesteps
 	]
 
-	# Model-coordinate positions of each thermal's (r, θ, φ) query points. The sphere is
-	# scaled by this timestep's radius and centered on this timestep's smoothed center.
+	# Model-coordinate positions of each thermal's (r, θ, φ) query points, centered on this
+	# timestep's smoothed center. Each direction is scaled by the thermal's radius in that
+	# direction: a (1, n_theta, n_phi) array for a directional boundary, or a single radius
+	# (1, 1, 1) for a sphere, both of which broadcast against the (n_r, 1, 1) radial axis.
 	query_points = map(timesteps) do ts
-		rho = grid.R .* ts.sphere_radius
+		rho = grid.R .* reshape(ts.boundary_radius, 1, size(ts.boundary_radius)...)
 		(
 			x=rho .* grid.sin_theta_cos_phi .+ ts.center_x,
 			y=rho .* grid.sin_theta_sin_phi .+ ts.center_y,
@@ -345,8 +413,13 @@ function _normalize_one_file(
 
 	NCDataset(rams_path, "r") do ds
 		for spec in context.specs
-			# Staggered inputs are sampled on their momentum axis, scalars on the thermo grid
-			staggered_axis = _spec_staggered_axis(spec)
+			# A horizontal-wind projection interpolates u and v separately, each on its own
+			# staggered axis, and projects them at the query points (see
+			# `horizontal_wind_component`)
+			is_projection = spec.projection !== :none
+			# Staggered inputs are sampled on their momentum axis, scalars on the thermo
+			# grid; a projection's inputs keep their own axes, so it has no common one
+			staggered_axis = is_projection ? :none : _spec_staggered_axis(spec)
 
 			# Decompress, once, every chunk that some thermal at this time needs
 			input_fields = Dict{String, Any}()
@@ -375,46 +448,64 @@ function _normalize_one_file(
 
 			for (timestep_index, (subset, query)) in
 				enumerate(zip(subsets, query_points))
-				# Native coordinates of this box, on the staggered axis where applicable
-				x_coords = staggered_axis === :x ? subset.xm_sub : subset.x_sub
-				y_coords = staggered_axis === :y ? subset.ym_sub : subset.y_sub
-				z_coords = staggered_axis === :z ? subset.zm_sub : subset.z_sub
+				if is_projection
+					# Project the separately interpolated u and v onto the thermal's
+					# horizontal axes at every (r, θ, φ) query point
+					_project_horizontal_wind!(
+						interpolated,
+						spec,
+						input_fields,
+						subset,
+						query,
+						grid,
+					)
+				else
+					# Native coordinates of this box, on the staggered axis where applicable
+					x_coords = staggered_axis === :x ? subset.xm_sub : subset.x_sub
+					y_coords = staggered_axis === :y ? subset.ym_sub : subset.y_sub
+					z_coords = staggered_axis === :z ? subset.zm_sub : subset.z_sub
 
-				# Cut this thermal's box out of the in-memory fields
-				native = Dict{String, Array{Float64, 3}}(
-					input_name => Float64.(
-						input_fields[input_name][
-							subset.x_ixs,
-							subset.y_ixs,
-							subset.z_ixs,
-						],
-					) for input_name in spec.inputs
-				)
+					# Cut this thermal's box out of the in-memory fields
+					native = Dict{String, Array{Float64, 3}}(
+						input_name => Float64.(
+							input_fields[input_name][
+								subset.x_ixs,
+								subset.y_ixs,
+								subset.z_ixs,
+							],
+						) for input_name in spec.inputs
+					)
 
-				# Clip non-negative inputs at zero BEFORE combining, so a derived total is
-				# summed from clipped species. Lossy compression turns true zeros into small
-				# values of either sign.
-				for input_name in spec.inputs
-					if input_name in context.nonnegative_vars
-						native[input_name] = max.(native[input_name], 0.0)
+					# Clip non-negative inputs at zero BEFORE combining, so a derived total is
+					# summed from clipped species. Lossy compression turns true zeros into small
+					# values of either sign.
+					for input_name in spec.inputs
+						if input_name in context.nonnegative_vars
+							native[input_name] = max.(native[input_name], 0.0)
+						end
 					end
+
+					# Combine inputs into the field to interpolate (pass-through for plain vars)
+					data_sub = spec.combine(native)
+
+					# Linear interpolation onto the (r, θ, φ) query points; NaN outside the box
+					itp = interpolate(
+						(x_coords, y_coords, z_coords),
+						data_sub,
+						Gridded(Linear()),
+					)
+					eitp = extrapolate(itp, NaN)
+					interpolated .= eitp.(query.x, query.y, query.z)
 				end
 
-				# Combine inputs into the field to interpolate (pass-through for plain vars)
-				data_sub = spec.combine(native)
-
-				# Linear interpolation onto the (r, θ, φ) query points; NaN outside the box
-				itp = interpolate(
-					(x_coords, y_coords, z_coords),
-					data_sub,
-					Gridded(Linear()),
-				)
-				eitp = extrapolate(itp, NaN)
-				interpolated .= eitp.(query.x, query.y, query.z)
-
 				if context.azimuthal_average
-					# Collapse φ to its mean (and spread) so only the (r, θ) profile is kept
-					phi_mean, phi_std = _azimuthal_mean_std(interpolated)
+					# Collapse φ to its mean (and spread) so only the (r, θ) profile is kept.
+					# With a directional boundary, each φ is weighted by its volume, R(θ, φ)³.
+					ts = timesteps[timestep_index]
+					phi_mean, phi_std =
+						is_directional(ts) ?
+						_azimuthal_mean_std(interpolated, ts.boundary_radius .^ 3) :
+						_azimuthal_mean_std(interpolated)
 					mean_by_name[spec.name][:, :, timestep_index] .= phi_mean
 					if std_by_name !== nothing
 						std_by_name[spec.name][:, :, timestep_index] .= phi_std
@@ -426,6 +517,64 @@ function _normalize_one_file(
 		end
 	end
 	return (mean_by_name, std_by_name)
+end
+
+"""
+	_interpolate_input_to_query(field, subset, staggered_axis, query)
+
+One RAMS input, cut to this thermal's native box and linearly interpolated to the thermal's
+`(r, θ, φ)` query points (NaN outside the box). `staggered_axis` picks the momentum
+coordinates on the axis the input is staggered along, so u and v can each be interpolated on
+their own Arakawa-C grid.
+"""
+function _interpolate_input_to_query(field, subset, staggered_axis::Symbol, query)
+	# Native coordinates of this box, on the staggered axis where applicable
+	x_coords = staggered_axis === :x ? subset.xm_sub : subset.x_sub
+	y_coords = staggered_axis === :y ? subset.ym_sub : subset.y_sub
+	z_coords = staggered_axis === :z ? subset.zm_sub : subset.z_sub
+	native = Float64.(field[subset.x_ixs, subset.y_ixs, subset.z_ixs])
+	itp = interpolate((x_coords, y_coords, z_coords), native, Gridded(Linear()))
+	return extrapolate(itp, NaN).(query.x, query.y, query.z)
+end
+
+"""
+	_project_horizontal_wind!(projected, spec, input_fields, subset, query, grid)
+
+Fill `projected` (shape `(n_r, n_θ, n_φ)`) with the horizontal wind of a projection spec,
+projected onto the thermal's radial or azimuthal direction at every query point.
+
+The query point at azimuth φ lies in the horizontal direction (cos φ, sin φ) from the
+thermal's axis (see the query-point construction in `_normalize_one_file`). The radial
+component is therefore `u cos φ + v sin φ`, and the azimuthal component
+`-u sin φ + v cos φ`. On the axis itself (r = 0, or θ = 0 or π) the direction is undefined;
+there the ring's points coincide, so the azimuthal mean of either component is zero.
+"""
+function _project_horizontal_wind!(projected, spec, input_fields, subset, query, grid)
+	u_name, v_name = spec.inputs
+	# Each component interpolated on its own staggered axis
+	u_at_query = _interpolate_input_to_query(
+		input_fields[u_name],
+		subset,
+		_staggered_axis(u_name),
+		query,
+	)
+	v_at_query = _interpolate_input_to_query(
+		input_fields[v_name],
+		subset,
+		_staggered_axis(v_name),
+		query,
+	)
+	# Horizontal direction of each query point from the axis, broadcast over (r, θ)
+	cos_phi = reshape(cos.(grid.phi_vals), 1, 1, :)
+	sin_phi = reshape(sin.(grid.phi_vals), 1, 1, :)
+	if spec.projection === :radial
+		projected .= u_at_query .* cos_phi .+ v_at_query .* sin_phi
+	elseif spec.projection === :azimuthal
+		projected .= .-u_at_query .* sin_phi .+ v_at_query .* cos_phi
+	else
+		error("unknown projection :$(spec.projection) for composite '$(spec.name)'")
+	end
+	return projected
 end
 
 """
@@ -467,6 +616,53 @@ function _azimuthal_mean_std(field::Array{Float64, 3})
 			sum_sq_dev += d * d
 		end
 		std_rt[i, j] = sqrt(sum_sq_dev / n_valid)
+	end
+	return mean_rt, std_rt
+end
+
+"""
+	_azimuthal_mean_std(field, volume_weights)
+
+Volume-weighted azimuthal mean and standard deviation of an `(r, θ, φ)` field, for a thermal
+whose radius depends on direction.
+
+At a fixed normalized radius, a grid point in direction (θ, φ) stands for a physical volume
+proportional to R(θ, φ)³ r_norm² sin θ dr dθ dφ. Along one ring of fixed (r, θ), the factor that
+varies with φ is R(θ, φ)³, given here as `volume_weights` with shape `(n_theta, n_phi)`. The
+weighted mean is therefore the average over the ring's physical volume, which is what a volume
+integral of the azimuthally averaged field needs. With equal weights it equals the plain mean.
+NaN samples are ignored, as in the unweighted version.
+"""
+function _azimuthal_mean_std(field::Array{Float64, 3}, volume_weights::AbstractMatrix{Float64})
+	n_r, n_theta, n_phi = size(field)
+	mean_rt = Array{Float64}(undef, n_r, n_theta)
+	std_rt = Array{Float64}(undef, n_r, n_theta)
+	@inbounds for j in 1:n_theta, i in 1:n_r
+		# Pass 1: weighted mean over the valid (non-NaN) φ samples
+		sum_weighted = 0.0
+		sum_weights = 0.0
+		for k in 1:n_phi
+			v = field[i, j, k]
+			isnan(v) && continue
+			sum_weighted += volume_weights[j, k] * v
+			sum_weights += volume_weights[j, k]
+		end
+		if sum_weights == 0.0
+			mean_rt[i, j] = NaN
+			std_rt[i, j] = NaN
+			continue
+		end
+		m = sum_weighted / sum_weights
+		mean_rt[i, j] = m
+		# Pass 2: weighted population variance about the mean
+		sum_sq_dev = 0.0
+		for k in 1:n_phi
+			v = field[i, j, k]
+			isnan(v) && continue
+			d = v - m
+			sum_sq_dev += volume_weights[j, k] * d * d
+		end
+		std_rt[i, j] = sqrt(sum_sq_dev / sum_weights)
 	end
 	return mean_rt, std_rt
 end
@@ -514,6 +710,8 @@ function _write_normalize_output(
 	azimuthal_average::Bool,
 	output_std::Union{Nothing, Function}=nothing,
 	compression_level::Int=1,
+	angular_variables::Dict{String, Any}=Dict{String, Any}(),
+	global_attributes::Dict{String, Any}=Dict{String, Any}(),
 )
 	thermal_ixs = [t.thermal_ix for t in tracks]
 
@@ -527,7 +725,7 @@ function _write_normalize_output(
 		compression_level > 0 ?
 		(shuffle=true, deflatelevel=compression_level) : NamedTuple()
 
-	NCDataset(path, "c") do ds
+	NCDataset(path, "c"; attrib=global_attributes) do ds
 		defDim(ds, "dt_thermal_seconds", length(all_dt_seconds))
 		defDim(ds, "thermal_ix", length(tracks))
 		defDim(ds, "r_norm", grid.n_r)
@@ -571,6 +769,25 @@ function _write_normalize_output(
 				attrib=extra_attrs[name],
 			)
 			v[:, :] = extras_2d[name]
+		end
+
+		# Per-sample quantities that depend on direction (θ, or θ and φ) but not on r_norm,
+		# stored (dt, thermal, θ[, φ]) like the fields; each entry is (array, attributes)
+		for (name, (values, attributes)) in angular_variables
+			angular_dims =
+				ndims(values) == 3 ? ("theta", "thermal_ix", "dt_thermal_seconds") :
+				("phi", "theta", "thermal_ix", "dt_thermal_seconds")
+			v = defVar(
+				ds,
+				name,
+				Float64,
+				angular_dims;
+				fillvalue=NaN,
+				compression_kwargs...,
+				attrib=attributes,
+			)
+			v[ntuple(_ -> Colon(), ndims(values))...] =
+				permutedims(values, reverse(ntuple(identity, ndims(values))))
 		end
 
 		defVar(ds, "x_norm", permutedims(x_norm), ("theta", "r_norm"))
@@ -650,6 +867,10 @@ sampled (see the `compute_spatial_subset` call).
 `String`, interpolated as-is) or a `CompositeSpec` built with `derived`/`derived_sum`
 (a quantity computed on the native RAMS grid before interpolation — see `CompositeSpec`).
 
+An entry built with `horizontal_wind_component` composites the horizontal wind projected onto
+the thermal's radial or azimuthal direction. Its u and v inputs are interpolated separately and
+projected at the query points before any azimuthal average (see `_project_horizontal_wind!`).
+
 `lite` selects which RAMS files to composite: lite (`a-L-`) or full-analysis (`a-A-`).
 Only thermal_ds times with a matching RAMS file are composited (see the availability check).
 
@@ -668,6 +889,24 @@ clipped species.
 
 `compression_level` (0–9, default 1) sets lossless deflate compression of the output file;
 0 writes it uncompressed. Values are bit-identical either way (see `_write_normalize_output`).
+
+# Direction-dependent boundaries
+
+By default every thermal is a sphere of radius `scale_var`, so `r_norm = 1` is that sphere.
+With `boundary_path`, the thermal's radius instead depends on direction: the file gives, for each
+(thermal, time), the distance R(θ, φ) from the center to the thermal's edge along every grid
+direction (see `read_boundary_radii`). The query point at normalized radius r in direction (θ, φ)
+then lies r R(θ, φ) from the center, so `r_norm = 1` is the boundary itself in every direction.
+Three things follow:
+
+- A (thermal, time) without radii in the file is not composited.
+- With `azimuthal_average`, each φ is weighted by its volume, R(θ, φ)³, so the φ-mean is the mean
+  over the ring's physical volume (`_azimuthal_mean_std` with weights).
+- The output gains `boundary_radius_cubed_phi_mean(dt, thermal, θ)`, the φ-mean of R³. A volume
+  integral of a φ-averaged field f is 2π Σ f ⟨R³⟩ r_norm² sin θ Δr Δθ. Without φ averaging, the
+  full `boundary_radius(dt, thermal, θ, φ)` is written instead.
+
+`scale_var` is still read with a boundary file: a timestep whose `scale_var` is NaN is skipped.
 
 # How the work is organized (and why it is fast)
 
@@ -704,6 +943,7 @@ function normalize_thermals(;
 	nonnegative_vars=String[],
 	n_workers::Int=1,
 	compression_level::Int=1,
+	boundary_path::Union{Nothing, AbstractString}=nothing,
 )
 	# Normalize each requested variable into a CompositeSpec: bare strings become pass-through
 	# specs; CompositeSpec entries (from derived/derived_sum) are kept as-is.
@@ -716,9 +956,23 @@ function normalize_thermals(;
 	rams_grid_path = String(rams_grid_path)
 	output_path = String(output_path)
 
+	grid = build_spherical_grid(n_r, n_theta, n_phi, Float64(r_norm_max))
+
+	# Direction-dependent boundary radii, when given
+	directional = boundary_path !== nothing
+	boundary_lookup = nothing
+	if directional
+		println("Reading direction-dependent boundary radii from $boundary_path")
+		boundary_lookup = read_boundary_radii(String(boundary_path), grid)
+		println("  $(length(boundary_lookup)) (thermal, time) samples with a boundary")
+	end
+
 	println("Reading thermal tracks from $thermal_ds_path")
-	tracks, extras, extra_names, extra_attrs =
-		read_thermal_tracks(thermal_ds_path; scale_var=String(scale_var))
+	tracks, extras, extra_names, extra_attrs = read_thermal_tracks(
+		thermal_ds_path;
+		scale_var=String(scale_var),
+		boundary_lookup=boundary_lookup,
+	)
 	println("  Found $(length(tracks)) thermals")
 	if !isempty(extra_names)
 		println(
@@ -730,7 +984,6 @@ function normalize_thermals(;
 	println("Reading RAMS grid from $rams_grid_path")
 	gc = read_rams_grid(rams_grid_path)
 
-	grid = build_spherical_grid(n_r, n_theta, n_phi, Float64(r_norm_max))
 	println(
 		"  Spherical grid: r=$(grid.n_r) × θ=$(grid.n_theta) × φ=$(grid.n_phi)",
 	)
@@ -864,6 +1117,47 @@ function normalize_thermals(;
 		end
 	end
 
+	# Direction-dependent radii of every composited sample: the φ-mean of R³ per θ (for volume
+	# integrals of φ-averaged fields), or the full R(θ, φ) when φ is kept
+	angular_variables = Dict{String, Any}()
+	if directional
+		if azimuthal_average
+			cubed_phi_mean = fill(NaN, n_dt, n_thermals, grid.n_theta)
+			for item_index in eachindex(item_timesteps)
+				radius = item_timesteps[item_index].boundary_radius
+				cubed_phi_mean[item_dt_ix[item_index], item_slot[item_index], :] .=
+					vec(sum(radius .^ 3; dims=2)) ./ size(radius, 2)
+			end
+			angular_variables["boundary_radius_cubed_phi_mean"] = (
+				cubed_phi_mean,
+				Dict{String, Any}(
+					"units" => "m3",
+					"long_name" => "azimuthal (phi) mean of the cubed boundary radius R(theta, phi)",
+				),
+			)
+		else
+			full_radius = fill(NaN, n_dt, n_thermals, grid.n_theta, grid.n_phi)
+			for item_index in eachindex(item_timesteps)
+				full_radius[item_dt_ix[item_index], item_slot[item_index], :, :] .=
+					item_timesteps[item_index].boundary_radius
+			end
+			angular_variables["boundary_radius"] = (
+				full_radius,
+				Dict{String, Any}(
+					"units" => "m",
+					"long_name" => "distance from the thermal center to its boundary along (theta, phi)",
+				),
+			)
+		end
+	end
+	global_attributes = Dict{String, Any}(
+		"normalization" =>
+			directional ? "direction-dependent boundary radius from $(boundary_path)" :
+			"sphere of radius $(scale_var)",
+		"azimuthal_mean_weighting" =>
+			directional && azimuthal_average ? "volume (boundary_radius cubed)" : "none",
+	)
+
 	# One job per RAMS file, in time order: (file path, the thermal timesteps it serves)
 	job_times = sort(collect(keys(item_indices_by_time)))
 	job_item_indices = [item_indices_by_time[t] for t in job_times]
@@ -939,6 +1233,8 @@ function normalize_thermals(;
 		output_std=azimuthal_average && include_azimuthal_std ?
 				   (name -> assemble_dense(name, 2)) : nothing,
 		compression_level=compression_level,
+		angular_variables=angular_variables,
+		global_attributes=global_attributes,
 	)
 	println("Done.")
 	return nothing

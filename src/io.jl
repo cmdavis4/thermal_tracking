@@ -23,6 +23,15 @@ end
 # Thermal track dataclasses (used by compute_thermal_shapes + normalize_thermals)
 # ──────────────────────────────────────────────────────────────────
 
+"""
+One timestep of one thermal track, as the normalization uses it.
+
+`boundary_radius` is the thermal's radius in every direction of the normalization grid, an
+`(n_theta, n_phi)` matrix: the distance from the center to the thermal's edge along each
+direction (θ, φ). A spherical thermal has the same radius in every direction, and is stored as
+the 1×1 matrix `[sphere_radius]`, which broadcasts over every direction. The normalized radius
+of a point is its distance from the center divided by the boundary radius in its direction.
+"""
 struct ThermalTimeStep
 	center_x::Float64
 	center_y::Float64
@@ -30,7 +39,23 @@ struct ThermalTimeStep
 	sphere_radius::Float64
 	dt_thermal_seconds::Float64
 	time::DateTime
+	boundary_radius::Matrix{Float64}
 end
+
+# A spherical thermal: the same radius in every direction
+ThermalTimeStep(center_x, center_y, center_z, sphere_radius, dt_thermal_seconds, time) =
+	ThermalTimeStep(
+		center_x,
+		center_y,
+		center_z,
+		sphere_radius,
+		dt_thermal_seconds,
+		time,
+		fill(Float64(sphere_radius), 1, 1),
+	)
+
+"""Whether a timestep's boundary radius depends on direction (false for a sphere)."""
+is_directional(ts::ThermalTimeStep) = size(ts.boundary_radius) != (1, 1)
 
 struct ThermalTrack
 	thermal_ix::Int   # 0-based, matching Python convention
@@ -56,12 +81,23 @@ it here also cuts memory/runtime by storing one output field instead of every in
 
 All inputs of a spec must share the same Arakawa-C staggering (all scalar, or all on the
 same momentum axis), since they're combined pointwise on one grid — see `_staggered_axis`.
+
+- `projection` — `:none` for every scalar composite above. `:radial` or `:azimuthal` marks a
+  horizontal-wind projection built by `horizontal_wind_component`: its two `inputs` are the
+  u and v wind components, which are interpolated separately (each on its own staggered
+  axis) and projected onto the thermal's horizontal axes AFTER interpolation. `combine` is
+  never called for such a spec.
 """
 struct CompositeSpec
 	name::String
 	inputs::Vector{String}
 	combine::Function
+	projection::Symbol
 end
+
+# Scalar specs, the only kind before horizontal-wind projections existed
+CompositeSpec(name::String, inputs::Vector{String}, combine::Function) =
+	CompositeSpec(name, inputs, combine, :none)
 
 """Pass-through composite: interpolate RAMS variable `name` as-is."""
 function composite(name::AbstractString)::CompositeSpec
@@ -77,6 +113,44 @@ interpolation. `combine` receives a `Dict` mapping each input name to its native
 """
 function derived(name::AbstractString, inputs, combine::Function)::CompositeSpec
 	CompositeSpec(String(name), String.(collect(inputs)), combine)
+end
+
+"""
+	horizontal_wind_component(name, component; u="UC", v="VC")
+
+Composite of the horizontal wind projected onto one horizontal axis of the thermal.
+
+`component = :radial` gives the wind component pointing away from the thermal's vertical
+axis, `u cos φ + v sin φ`, positive outward. `component = :azimuthal` gives the component
+around the axis, `-u sin φ + v cos φ`, positive counterclockwise seen from above. Here φ is
+the azimuth of each query point about the thermal's (smoothed) center, measured from +x.
+
+Why a projection needs its own path: u and v sit on different Arakawa-C staggered axes, so
+they cannot be combined pointwise on one native grid, and the projection depends on φ, which
+exists only at the query points. `normalize_thermals` therefore interpolates u and v to the
+full (r, θ, φ) query grid separately and projects them there, BEFORE any azimuthal average.
+Averaging u and v first would leave only the thermal's drift and lose the radial flow.
+
+The winds are ground-relative. A uniform horizontal wind, such as the thermal's own drift,
+projects to zero radial flow on average around a ring, so the azimuthal MEAN of the radial
+component needs no translation correction. The azimuthal spread (`_phi_std`) does include
+the drift.
+"""
+function horizontal_wind_component(
+	name::AbstractString,
+	component::Symbol;
+	u::AbstractString="UC",
+	v::AbstractString="VC",
+)::CompositeSpec
+	component in (:radial, :azimuthal) ||
+		error("component must be :radial or :azimuthal, got :$component")
+	# `combine` is never called for a projection spec; it errors if it ever is
+	CompositeSpec(
+		String(name),
+		[String(u), String(v)],
+		native -> error("a horizontal-wind projection is not combined natively"),
+		component,
+	)
 end
 
 """
