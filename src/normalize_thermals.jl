@@ -51,7 +51,7 @@ end
 Read a file of direction-dependent thermal boundary radii into a lookup from
 `(thermal_ix, time)` to an `(n_theta, n_phi)` radius matrix.
 
-The file (written by `thermals.watershed_boundaries` in the thermals repository) is indexed by
+The file (written by `thermals.ellipsoid_boundaries` in the thermals repository) is indexed by
 sample, not by thermal and time, because only a small share of all (thermal, time) pairs hold a
 thermal. Python dimensions: `boundary_radius(sample, theta, phi)` in meters,
 `sample_thermal_ix(sample)`, and `sample_time(sample)`, with `theta` and `phi` coordinates.
